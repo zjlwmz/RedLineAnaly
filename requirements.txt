@@ -1,0 +1,11 @@
+# 计算节点 / 主节点 共用依赖
+# 注意：osgeo(GDAL) 不走 pip，Ubuntu 上用: apt install gdal-bin python3-gdal
+#       且系统绑定只兼容系统 Python（/usr/bin/python3），不要用 pyenv/conda 的 Python 跑本工程
+shapely>=2.0
+pyproj>=3.6
+pika>=1.3
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+# 可选：Redis 心跳做动态 worker 发现（不用 Redis 也能跑，自动降级本地扫描）
+# redis>=5.0

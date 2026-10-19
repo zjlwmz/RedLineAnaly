@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>国土图斑 · 全国红线叠加分析</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<style>
+  :root{
+    --bg:#f5f6f8; --panel:#ffffff; --line:#e3e6ea; --text:#1f2328; --sub:#6b7280;
+    --brand:#1d4ed8; --danger:#d92d20; --warn:#dc6803; --ok:#067647; --mute:#98a2b3;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font:14px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:var(--bg)}
+  #app{display:flex;height:100%}
+  #side{width:420px;min-width:420px;height:100%;overflow-y:auto;background:var(--panel);border-right:1px solid var(--line);padding:18px 18px 40px}
+  #map{flex:1;height:100%}
+  h1{font-size:17px;margin:0 0 2px;letter-spacing:.2px}
+  .sub{color:var(--sub);font-size:12px;margin-bottom:14px}
+  .card{background:#fbfcfd;border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .row+.row{margin-top:8px}
+  label{font-size:12px;color:var(--sub);display:block;margin-bottom:3px}
+  input[type=text],input[type=number],select{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;background:#fff}
+  button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:7px 12px;font-size:13px;cursor:pointer;transition:.15s}
+  button:hover{border-color:#c7ccd4;background:#fafbfc}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+  button.primary:hover{background:#1740b5}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .ghost{color:var(--sub)}
+  .verdict{border-radius:10px;padding:14px 14px 12px;margin-bottom:12px;border:1px solid;position:relative;overflow:hidden}
+  .verdict .big{font-size:20px;font-weight:700;letter-spacing:.3px}
+  .verdict .note{font-size:12px;margin-top:4px;opacity:.85}
+  .v-clear{background:#ecfdf3;border-color:#abefc6;color:#067647}
+  .v-occupied{background:#fffaeb;border-color:#fec84b;color:#b54708}
+  .v-severe{background:#fef3f2;border-color:#fda29b;color:#b42318}
+  .v-outside{background:#f2f4f7;border-color:#d0d5dd;color:#475467}
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .metric{background:#fbfcfd;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .metric .k{font-size:11px;color:var(--sub)}
+  .metric .v{font-size:15px;font-weight:650;margin-top:1px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:6px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--sub);font-weight:500;font-size:11.5px;background:#fafbfc}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid}
+  .t-eco{color:#067647;border-color:#abefc6;background:#ecfdf3}
+  .t-farm{color:#b54708;border-color:#fec84b;background:#fffaeb}
+  .t-urban{color:#3538cd;border-color:#c7d7fe;background:#eef4ff}
+  .bar{height:6px;border-radius:3px;background:#eaecf0;overflow:hidden;margin-top:3px}
+  .bar>i{display:block;height:100%;background:var(--brand)}
+  .warn{background:#fffaeb;border:1px solid #fedf89;color:#b54708;border-radius:8px;padding:8px 10px;font-size:12px;margin-bottom:8px}
+  .warn ul{margin:4px 0 0 16px;padding:0}
+  .hidden{display:none}
+  .legend{position:absolute;right:12px;bottom:12px;z-index:800;background:rgba(255,255,255,.95);
+          border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+  .legend div{display:flex;align-items:center;gap:6px;margin:3px 0}
+  .sw{width:12px;height:12px;border-radius:3px;border:1px solid rgba(0,0,0,.15)}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid #cfd4dc;border-top-color:var(--brand);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  code{background:#f2f4f7;padding:1px 4px;border-radius:4px;font-size:11.5px}
+  .muted{color:var(--mute);font-size:12px}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <h1>国土图斑 × 全国红线叠加分析</h1>
+    <div class="sub">动态省份识别 · RabbitMQ 分布式计算 · 幂等汇总</div>
+
+    <div class="card">
+      <div class="row">
+        <div style="flex:1">
+          <label>图斑编号</label>
+          <input id="fid" type="text" value="P-2024-0001" />
+        </div>
+      </div>
+      <div class="row">
+        <div style="flex:1">
+          <label>严重压盖阈值（占输入面比例）</label>
+          <select id="threshold">
+            <option value="0.3">30%</option>
+            <option value="0.5" selected>50%（默认）</option>
+            <option value="0.7">70%</option>
+          </select>
+        </div>
+        <div style="flex:1">
+          <label>红线缓冲（米）</label>
+          <input id="buffer" type="number" value="50" min="0" max="5000" step="10" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnRun" disabled>分析当前图斑</button>
+        <button id="btnDemo">载入示例</button>
+        <button class="ghost" id="btnClear">清空</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="muted" id="hint">在地图上用左上角「▱」工具绘制多边形，或点「载入示例」</span>
+      </div>
+    </div>
+
+    <div id="status" class="hidden"></div>
+    <div id="result" class="hidden"></div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script>
+const API = location.origin;
+const STATE = { geom: null, layer: null };
+const TYPE_CLASS = {'生态保护红线':'t-eco','永久基本农田':'t-farm','城镇开发边界':'t-urban'};
+const TYPE_COLOR = {'生态保护红线':'#12b76a','永久基本农田':'#f79009','城镇开发边界':'#444ce7'};
+
+const basemap = L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+  {subdomains:['1','2','3','4'], maxZoom:18, attribution:'高德地图'});
+const map = L.map('map', {center:[39.2, 116.4], zoom:9, layers:[basemap]});
+
+// 只读红线图层（从演示数据直接读，便于肉眼核对）
+const redlineLayer = L.layerGroup().addTo(map);
+(async function loadRedlinePreview(){
+  const files = ['110000','120000','130000','140000','370000','410000'];
+  for (const f of files){
+    try{
+      // 由后端 /data 静态目录暴露；GeoJSON 直接可读
+      const url = `/data/redline/${f}.gpkg`;
+      // GPKG 浏览器读不了，改用后端导出的 geojson（见 main.py /api/v1/preview）
+    }catch(e){}
+  }
+})();
+
+const drawnItems = new L.FeatureGroup().addTo(map);
+map.addControl(new L.Control.Draw({
+  position:'topleft',
+  draw:{polygon:{allowIntersection:false, showArea:true, shapeOptions:{color:'#1d4ed8',fillOpacity:.12}},
+        rectangle:{shapeOptions:{color:'#1d4ed8',fillOpacity:.12}}, marker:false, circle:false, polyline:false, circlemarker:false},
+  edit:{featureGroup:drawnItems, remove:true}
+}));
+
+map.on(L.Draw.Event.CREATED, e => {
+  drawnItems.clearLayers();
+  const layer = e.layer;
+  drawnItems.addLayer(layer);
+  STATE.geom = layer.toGeoJSON().geometry;
+  document.getElementById('btnRun').disabled = false;
+  document.getElementById('hint').textContent = '已绘制图斑，点击「分析当前图斑」';
+  map.fitBounds(layer.getBounds(), {padding:[30,30]});
+});
+
+const $ = id => document.getElementById(id);
+const fmtArea = m2 => m2 >= 1e6 ? (m2/1e6).toFixed(2)+' km²' : m2.toFixed(0)+' m²';
+const fmtNum = (v,d=2) => Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d});
+
+function statusBar(html){ const s=$('status'); s.classList.remove('hidden'); s.innerHTML=html; }
+
+$('btnDemo').onclick = async () => {
+  const g = {type:'Polygon', coordinates:[[[116.85,40.50],[117.20,40.50],[117.20,40.75],[116.85,40.75],[116.85,40.50]]]};
+  drawnItems.clearLayers();
+  const layer = L.geoJSON(g, {style:{color:'#1d4ed8',weight:2,fillOpacity:.12}}).addTo(drawnItems);
+  STATE.geom = g;
+  $('btnRun').disabled = false;
+  map.fitBounds(layer.getBounds(), {padding:[40,40]});
+  $('hint').textContent = '示例：北京东部山区，横跨京冀两省';
+};
+
+$('btnClear').onclick = () => {
+  drawnItems.clearLayers();
+  STATE.geom = null;
+  $('btnRun').disabled = true;
+  $('result').classList.add('hidden');
+  $('status').classList.add('hidden');
+  $('hint').textContent = '在地图上用左上角「▱」工具绘制多边形，或点「载入示例」';
+  resetRedlines();
+};
+
+$('btnRun').onclick = async () => {
+  if (!STATE.geom) return;
+  const btn = $('btnRun');
+  btn.disabled = true;
+  statusBar('<span class="spinner"></span>正在识别省份并分发计算任务…');
+  $('result').classList.add('hidden');
+  const t0 = performance.now();
+  try{
+    const resp = await fetch(API+'/api/v1/overlay/analyze', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        feature_id: $('fid').value || 'P-UNKNOWN',
+        geometry: STATE.geom,
+        geometry_srid: 4326,
+        severe_ratio: parseFloat($('threshold').value),
+        buffer_m: parseFloat($('buffer').value) || 0,
+        wait_timeout: 120
+      })
+    });
+    if(!resp.ok){ throw new Error((await resp.json()).detail || resp.statusText); }
+    const r = await resp.json();
+    const dt = performance.now() - t0;
+    render(r, dt);
+    $('status').classList.add('hidden');
+  }catch(e){
+    statusBar(`<div class="warn">分析失败：${e.message}</div>`);
+  }finally{
+    btn.disabled = false;
+  }
+};
+
+function render(r, dt){
+  const box = $('result');
+  box.classList.remove('hidden');
+  const cls = {CLEAR:'v-clear', OCCUPIED:'v-occupied', SEVERE:'v-severe', OUTSIDE:'v-outside'}[r.severity];
+  const icon = {CLEAR:'✓', OCCUPIED:'!', SEVERE:'▲', OUTSIDE:'?'}[r.severity];
+  const warnHtml = r.warnings.length ? `<div class="warn"><b>提示</b><ul>${r.warnings.map(w=>`<li>${w}</li>`).join('')}</ul></div>` : '';
+
+  box.innerHTML = `
+    ${warnHtml}
+    <div class="verdict ${cls}">
+      <div class="big">${icon} ${r.severity_text}</div>
+      <div class="note">${r.is_compliant === true ? '合规（未压盖）' :
+        r.is_compliant === false ? `不合规 · 压盖 ${r.overlap_ratio_union.toFixed(2)}%` : '结论无效，请检查输入范围'}
+        &nbsp;·&nbsp; 耗时 ${dt.toFixed(0)}ms</div>
+    </div>
+    <div class="metrics">
+      <div class="metric"><div class="k">输入面积（等积投影）</div><div class="v">${fmtArea(r.input_area_m2)}</div></div>
+      <div class="metric"><div class="k">压盖面积（并集）</div><div class="v">${fmtArea(r.union_overlap_area_m2)}</div></div>
+      <div class="metric"><div class="k">压盖占比 · 并集口径</div><div class="v">${r.overlap_ratio_union.toFixed(2)}%</div>
+        <div class="bar"><i style="width:${Math.min(100,r.overlap_ratio_union)}%"></i></div></div>
+      <div class="metric"><div class="k">压盖占比 · 相加口径</div><div class="v">${r.overlap_ratio.toFixed(2)}%</div>
+        <div class="bar"><i style="width:${Math.min(100,r.overlap_ratio)}%;background:#98a2b3"></i></div></div>
+    </div>
+
+    <div class="card">
+      <div class="row"><b style="font-size:13px">按红线类型</b>
+        <span class="muted" style="margin-left:auto">识别 ${r.task_summary.expected} 省 · 成功 ${r.task_summary.succeeded} · 失败 ${r.task_summary.failed}</span>
+      </div>
+      <table style="margin-top:6px">
+        <thead><tr><th>类型</th><th class="num">压盖面积</th><th class="num">占输入面</th><th class="num">图斑数</th></tr></thead>
+        <tbody>${r.by_type.length ? r.by_type.map(t=>`
+          <tr><td><span class="tag ${TYPE_CLASS[t.redline_type]||''}">${t.redline_type}</span></td>
+          <td class="num">${fmtArea(t.overlap_area)}</td>
+          <td class="num">${(t.overlap_area/r.input_area_m2*100).toFixed(2)}%</td>
+          <td class="num">${t.patch_count}</td></tr>`).join('')
+          : `<tr><td colspan="4" class="muted">无压盖</td></tr>`}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <b style="font-size:13px">按省份</b>
+      <table style="margin-top:6px">
+        <thead><tr><th>省份</th><th class="num">压盖面积</th><th class="num">命中/扫描</th><th>计算节点</th></tr></thead>
+        <tbody>${r.provinces.map(p=>`<tr>
+          <td>${p.province_name}</td>
+          <td class="num">${fmtArea(p.overlap_area)}</td>
+          <td class="num">${p.patch_count}/${p.patches_scanned}</td>
+          <td><code>${p.worker_id||'-'}</code> <span class="muted">${p.elapsed_ms?p.elapsed_ms+'ms':''}</span></td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <b style="font-size:13px">图斑明细</b>
+      <table style="margin-top:6px">
+        <thead><tr><th>图斑</th><th>类型</th><th class="num">面积</th><th class="num">占比</th></tr></thead>
+        <tbody>${r.patches.length ? r.patches.slice(0,20).map(p=>`<tr>
+          <td><code>${p.patch_id}</code></td>
+          <td><span class="tag ${TYPE_CLASS[p.redline_type]||''}">${p.redline_type}</span></td>
+          <td class="num">${fmtArea(p.overlap_area)}</td>
+          <td class="num">${(p.overlap_area/r.input_area_m2*100).toFixed(2)}%</td>
+        </tr>`).join('') : `<tr><td colspan="4" class="muted">无</td></tr>`}</tbody>
+      </table>
+      ${r.patches.length>20?`<div class="muted" style="margin-top:6px">仅显示前 20 条，共 ${r.patches.length} 条</div>`:''}
+    </div>
+
+    <div class="card">
+      <div class="muted">
+        分发方式 <code>${r.dispatch.mode}</code> · 节点 <code>${(r.dispatch.workers||[]).join(', ')||'-'}</code><br>
+        省份识别 ${(r.dispatch.provinces_detected||[]).map(p=>`${p.name}(${(p.area_ratio*100).toFixed(0)}%)`).join('、') || '-'}<br>
+        批次 <code>${r.batch_id}</code>
+      </div>
+    </div>
+  `;
+
+  drawOverlap(r);
+  map.fitBounds(drawnItems.getBounds(), {padding:[30,30]});
+}
+
+let overlapLayer = L.layerGroup().addTo(map);
+let redlineVLayers = [];
+
+function resetRedlines(){
+  redlineVLayers.forEach(l=>map.removeLayer(l));
+  redlineVLayers = [];
+  overlapLayer.clearLayers();
+}
+
+async function drawOverlap(r){
+  resetRedlines();
+  // 1) 压盖结果：按类型着色
+  const byType = {};
+  (r.patches||[]).forEach(p=>{
+    const c = TYPE_COLOR[p.redline_type] || '#d92d20';
+    // 后端未回传每个 patch 的几何到前端时，退化为整个 union 叠加
+  });
+  if (r.overlap_geometry){
+    const gj = L.geoJSON(r.overlap_geometry, {style:{color:'#d92d20',weight:1,fillColor:'#f04438',fillOpacity:.45}});
+    gj.bindPopup(`<b>压盖区域</b><br>并集面积 ${fmtArea(r.union_overlap_area_m2)}<br>占输入面 ${r.overlap_ratio_union.toFixed(2)}%`);
+    overlapLayer.addLayer(gj);
+  }
+  // 2) 命中红线的原始图斑（提示用）
+  const provs = (r.dispatch?.provinces_detected || []).map(p=>p.code);
+  for (const code of provs){
+    try{
+      const geojson = await (await fetch(`${API}/api/v1/redline/${code}`)).json();
+      if (!geojson.features?.length) continue;
+      const layer = L.geoJSON(geojson, {
+        style: f => ({color:'#98a2b3', weight:1, dashArray:'4 3', fill:false}),
+        onEachFeature: (f,l)=>l.bindTooltip(`<b>${f.properties.redline_type}</b><br>${f.properties.patch_id}`)
+      });
+      layer.addTo(map);
+      redlineVLayers.push(layer);
+    }catch(e){}
+  }
+}
+
+// 图层图例
+const legend = L.control({position:'bottomright'});
+legend.onAdd = () => {
+  const d = L.DomUtil.create('div','legend');
+  d.innerHTML = `<b style="font-size:12px">图例</b>
+    <div><span class="sw" style="background:#1d4ed8;opacity:.4"></span>输入图斑</div>
+    <div><span class="sw" style="background:#f04438;opacity:.6"></span>压盖区域</div>
+    <div><span class="sw" style="background:#fff;border:1px dashed #98a2b3"></span>红线图斑</div>`;
+  return d;
+};
+legend.addTo(map);
+
+// 顶部状态
+(async () => {
+  try{
+    const m = await (await fetch(API+'/api/v1/meta')).json();
+    const total = Object.values(m.redline_stats).reduce((a,b)=>a+b,0);
+    statusBar(`<div class="card" style="margin:0 0 12px;font-size:12px">
+      MQ ${m.mq_available?'<span class="tag" style="color:#067647;border-color:#abefc6;background:#ecfdf3">已连接</span>':'<span class="tag">不可用</span>'}
+      · 计算节点 ${m.workers.length} 个 <code>${m.workers.join(', ')||'-'}</code>
+      · 红线图斑 ${total} 个 / ${Object.keys(m.redline_stats).length} 省
+    </div>`);
+  }catch(e){}
+})();
+</script>
+</body>
+</html>
