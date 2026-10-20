@@ -14,8 +14,8 @@ from typing import Optional
 
 from osgeo import ogr
 
-import geo
-from _config import settings
+from . import geo
+from ._config import settings
 
 ogr.UseExceptions()
 

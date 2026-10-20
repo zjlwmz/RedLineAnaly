@@ -13,10 +13,21 @@ import sys
 
 from osgeo import ogr
 
-import geo
-import province
-from overlay import overlay_province
-from redline_index import RedlineStore
+if __package__ is None:
+    # 脚本直接运行：python core/quickstart.py（__package__ 为 None）
+    # 把父目录加入 sys.path，然后用绝对导入（core.xxx）
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core import geo
+    from core import province
+    from core.overlay import overlay_province
+    from core.redline_index import RedlineStore  # noqa: F401
+else:
+    # 作为包导入：from core.quickstart import analyze
+    from . import geo
+    from . import province
+    from .overlay import overlay_province
+    from .redline_index import RedlineStore
 
 ogr.UseExceptions()
 

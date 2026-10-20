@@ -13,8 +13,8 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from app import geo, province  # noqa: E402
-from app.overlay import overlay_province  # noqa: E402
+from core import geo, province  # noqa: E402
+from core.overlay import overlay_province  # noqa: E402
 
 CASES = [
     # (名称, 多边形, 期望省份列表)

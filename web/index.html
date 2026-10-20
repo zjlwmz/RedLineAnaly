@@ -111,7 +111,7 @@
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-const API = location.origin;
+const API = 'http://127.0.0.1:8001';
 const STATE = { geom: null, layer: null };
 const TYPE_CLASS = {'生态保护红线':'t-eco','永久基本农田':'t-farm','城镇开发边界':'t-urban'};
 const TYPE_COLOR = {'生态保护红线':'#12b76a','永久基本农田':'#f79009','城镇开发边界':'#444ce7'};
@@ -181,11 +181,12 @@ $('btnRun').onclick = async () => {
   if (!STATE.geom) return;
   const btn = $('btnRun');
   btn.disabled = true;
-  statusBar('<span class="spinner"></span>正在识别省份并分发计算任务…');
   $('result').classList.add('hidden');
   const t0 = performance.now();
   try{
-    const resp = await fetch(API+'/api/v1/overlay/analyze', {
+    // 1) 分发任务
+    statusBar('<span class="spinner"></span>正在识别省份并分发计算任务…');
+    const resp = await fetch(API+'/overlay/analyze', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -197,8 +198,34 @@ $('btnRun').onclick = async () => {
         wait_timeout: 120
       })
     });
-    if(!resp.ok){ throw new Error((await resp.json()).detail || resp.statusText); }
-    const r = await resp.json();
+    if(!resp.ok){ throw new Error(((await resp.json()).msg) || resp.statusText); }
+    const submit = (await resp.json()).data;
+    const batch_id = submit.batch_id;
+    const dispatch_mode = submit.dispatch_mode;
+
+    // 2) 等待结果（local 模式后端已经在 POST 里算完直接返回 summary，mq 模式要轮询）
+    let r = submit;
+    if (dispatch_mode === 'mq') {
+      statusBar(`<span class="spinner"></span>MQ 模式 · 已分发 ${submit.subtask_count} 个省任务，等待计算…`);
+      const deadline = Date.now() + 120000; // 最多等 120s
+      while (Date.now() < deadline) {
+        await new Promise(res => setTimeout(res, 500));
+        const r2 = await (await fetch(`${API}/overlay/result?batchId=${batch_id}`)).json();
+        if (r2.success && r2.data) {
+          const task = r2.data;
+          // 全部子任务完成或超时（task_summary.pending=0 时聚合写入 summary）
+          const pending = (task.task_summary?.pending ?? 0);
+          const failed = (task.task_summary?.failed ?? 0);
+          if (!pending || task.status === 'done' || task.status === 'failed') {
+            r = task;
+            break;
+          }
+        }
+      }
+      if (!r.severity) throw new Error('计算超时（>120s），请检查 Slave 是否启动');
+    }
+
+    r.dispatch_mode = dispatch_mode;
     const dt = performance.now() - t0;
     render(r, dt);
     $('status').classList.add('hidden');
@@ -277,9 +304,8 @@ function render(r, dt){
 
     <div class="card">
       <div class="muted">
-        分发方式 <code>${r.dispatch.mode}</code> · 节点 <code>${(r.dispatch.workers||[]).join(', ')||'-'}</code><br>
-        省份识别 ${(r.dispatch.provinces_detected||[]).map(p=>`${p.name}(${(p.area_ratio*100).toFixed(0)}%)`).join('、') || '-'}<br>
-        批次 <code>${r.batch_id}</code>
+        批次 <code>${r.batch_id}</code> · 分发方式 <code>${r.dispatch_mode || '-'}</code><br>
+        耗时 ${dt.toFixed(0)}ms
       </div>
     </div>
   `;
@@ -299,30 +325,11 @@ function resetRedlines(){
 
 async function drawOverlap(r){
   resetRedlines();
-  // 1) 压盖结果：按类型着色
-  const byType = {};
-  (r.patches||[]).forEach(p=>{
-    const c = TYPE_COLOR[p.redline_type] || '#d92d20';
-    // 后端未回传每个 patch 的几何到前端时，退化为整个 union 叠加
-  });
+  // 压盖结果：按类型着色
   if (r.overlap_geometry){
     const gj = L.geoJSON(r.overlap_geometry, {style:{color:'#d92d20',weight:1,fillColor:'#f04438',fillOpacity:.45}});
     gj.bindPopup(`<b>压盖区域</b><br>并集面积 ${fmtArea(r.union_overlap_area_m2)}<br>占输入面 ${r.overlap_ratio_union.toFixed(2)}%`);
     overlapLayer.addLayer(gj);
-  }
-  // 2) 命中红线的原始图斑（提示用）
-  const provs = (r.dispatch?.provinces_detected || []).map(p=>p.code);
-  for (const code of provs){
-    try{
-      const geojson = await (await fetch(`${API}/api/v1/redline/${code}`)).json();
-      if (!geojson.features?.length) continue;
-      const layer = L.geoJSON(geojson, {
-        style: f => ({color:'#98a2b3', weight:1, dashArray:'4 3', fill:false}),
-        onEachFeature: (f,l)=>l.bindTooltip(`<b>${f.properties.redline_type}</b><br>${f.properties.patch_id}`)
-      });
-      layer.addTo(map);
-      redlineVLayers.push(layer);
-    }catch(e){}
   }
 }
 
@@ -341,12 +348,16 @@ legend.addTo(map);
 // 顶部状态
 (async () => {
   try{
-    const m = await (await fetch(API+'/api/v1/meta')).json();
-    const total = Object.values(m.redline_stats).reduce((a,b)=>a+b,0);
+    const health = await (await fetch(API+'/health')).json();
+    let workerCount = 0, workerNames = [];
+    try{
+      const nodes = await (await fetch(API+'/nodes')).json();
+      workerCount = nodes.data?.workerCount || 0;
+      workerNames = (nodes.data?.workers||[]).map(w=>w.consumerTag||w.connectionName).filter(Boolean);
+    }catch(e){}
     statusBar(`<div class="card" style="margin:0 0 12px;font-size:12px">
-      MQ ${m.mq_available?'<span class="tag" style="color:#067647;border-color:#abefc6;background:#ecfdf3">已连接</span>':'<span class="tag">不可用</span>'}
-      · 计算节点 ${m.workers.length} 个 <code>${m.workers.join(', ')||'-'}</code>
-      · 红线图斑 ${total} 个 / ${Object.keys(m.redline_stats).length} 省
+      服务 <span class="tag" style="color:#067647;border-color:#abefc6;background:#ecfdf3">已启动</span>
+      · 计算节点 ${workerCount} 个 <code>${workerNames.join(', ')||'-'}</code>
     </div>`);
   }catch(e){}
 })();

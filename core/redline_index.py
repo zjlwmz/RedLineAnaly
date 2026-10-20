@@ -15,7 +15,7 @@ from typing import Iterable, Iterator, Optional
 
 from osgeo import ogr
 
-from _config import settings
+from ._config import settings
 
 ogr.UseExceptions()
 

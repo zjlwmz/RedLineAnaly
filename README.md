@@ -1,123 +1,120 @@
 # 国土图斑 × 全国红线叠加分析
 
-基于《红线叠加分析技术方案（分布式版）》的可运行实现：**输入区域面 → 动态识别涉及省份 → RabbitMQ 按省拆分子任务 → GDAL/OGR 空间相交 → 幂等汇总 → 合规结论 + 地图渲染**。
+分布式红线压盖分析算子：**输入一个面 → 动态识别涉及省份 → RabbitMQ 共享队列分发 → 多节点并行 OGR 空间相交 → SQLite 幂等汇总 → 合规判定 + 地图渲染**。
 
-仓库里有两套代码，按用途选：
+架构参考自 [op-hub](https://github.com/) 分布式算子模板（config.ini 配置、统一入口 role 分发、共享队列 + SQLite 持久化）。
 
-| 目录 | 内容 | 适用场景 |
-|---|---|---|
-| `core/` | 4 个核心 py + `quickstart.py`，无 MQ、无 Web，单机串行 | 验证算法、调试数据、参考实现 |
-| `app/` + `web/` | 完整工程：FastAPI 主节点 + RabbitMQ + 计算节点 + Leaflet 前端 | 联调、压测、上生产前验证 |
+## 快速开始
 
 ```bash
-# 核心算法（最快路径，秒级出结果）
-cd core && ./run_demo.sh
+conda activate gis          # 确保 GDAL / pyproj / pika / fastapi / pydantic 都在
 
-# 完整工程（需要 docker 跑 RabbitMQ）
-bash scripts/bootstrap.sh
-bash scripts/run_all.sh        # 打开 http://127.0.0.1:8001/
-/usr/bin/python3 tests/e2e_test.py
+# 1) 单节点跑通（推荐本地验证）
+python main.py              # config.ini 默认 role=all：Master + Slave 合一
+# → 打开 http://127.0.0.1:8001/ 点「载入示例」→「分析当前图斑」
+
+# 2) 分布式跑
+docker run -d --name redline-rmq -p 5672:5672 rabbitmq:3-alpine
+python main.py master       # 终端 A：只起 REST 接口
+python main.py slave        # 终端 B：起计算节点（多开几个自动分担）
 ```
 
-> **依赖**：GDAL 的 Python 绑定（`osgeo`）走系统包，必须用**系统 Python**（`/usr/bin/python3`）：
-> `apt install gdal-bin python3-gdal`。venv/conda 的 Python 读不到这套绑定。
+> **依赖说明**：GDAL Python 绑定（`osgeo`）建议 conda 安装（`conda install -c conda-forge gdal pyproj shapely`）。MQ 不可用时自动降级本地串行计算。
 
-| 严重压盖（跨省示例） | 多类型压盖（雄安） | 未压盖（山东） |
-|---|---|---|
-| ![](docs/screenshot-severe.png) | ![](docs/screenshot-multi.png) | ![](docs/screenshot-clear.png) |
-
-| 端口 | 服务 |
-|---|---|
-| 8001 | 主节点 API + 前端页面 |
-| 5672 | RabbitMQ（docker） |
-
-## 1. 架构
+## 架构
 
 ```
-             ┌──────────────────────────────────────────────┐
-  前端地图    │  main.py  (FastAPI 主节点)                    │
-  (Leaflet)  │  ├─ 坐标统一 → CGCS2000 / EPSG:4490           │
-   ──POST──▶ │  ├─ 省份识别（bbox 预筛 + 包围盒精确相交）      │
-             │  ├─ 动态拆 N 个子任务 → RabbitMQ fanout       │
-             │  └─ 汇总（幂等合并）+ 合规判定                 │
-             └───────────────┬──────────────────────────────┘
-                             │  redline.task.{worker_id}
+             ┌─────────────────────────────────────────────┐
+  前端地图    │  main.py (role=master)                       │
+  (Leaflet)  │  ├─ 坐标统一 → CGCS2000 / EPSG:4490          │
+   ──POST──▶ │  ├─ 省份识别（bbox 预筛 + 包围盒精确相交）     │
+             │  ├─ 按省拆 N 个子任务 → topic exchange 投递    │
+             │  ├─ SQLite 落库 + 恢复线程                    │
+             │  └─ 结果消费线程（更新 subtask.status）        │
+             └───────────────┬─────────────────────────────┘
+                             │ task.redline.calculate
               ┌──────────────┴──────────────┐
         ┌─────▼─────┐                 ┌─────▼─────┐
-        │ worker-1  │      ...        │ worker-N  │   每个 worker 一个独占队列
-        │ OGR 相交  │                 │ OGR 相交  │   prefetch=1，天然负载均衡
+        │ slave-1   │     ...         │ slave-N   │   共享 redline_task_queue
+        │ OGR 相交  │                 │ OGR 相交  │   prefetch=1 天然负载均衡
         └─────┬─────┘                 └─────┬─────┘
-              │  redline.result                 │
-              └───────────────┬─────────────────┘
+              │ result.redline.overlay        │
+              └───────────────┬──────────────┘
                               ▼
                      主节点结果聚合（batch_id + task_id 去重）
 ```
 
-为什么用 **fanout 到独占队列** 而不是一个共享队列：一条消息只能被一个消费者拿到。按省拆的任务要分给不同节点，就必须「每个节点一份」，否则一个节点的结果会顶掉另一个节点的结果。见 `app/topology.py`。
+共享队列 vs 原独占队列：同省任务任意 worker 都能处理，不需要「worker 发现」逻辑。MQ 不可用时 Master 自动降级本地串行。
 
-## 2. 相对原方案的修正（重要）
+## 为什么面积计算要这么复杂
 
-原方案有 6 处会导致**错误结论**或**跑不起来**的问题，实现时已修正：
+绝大多数项目直接 `GetArea()` 得到的是**平方度**（EPSG:4490 经纬度坐标下），高纬误差可达数倍。本实现：
 
-| # | 原方案 | 问题 | 本实现 |
-|---|---|---|---|
-| 1 | `overlap_ratio = S_overlap / S_original` | 跨省时各省面积相加会 **>100%**；且没考虑**红线之间互相重叠**（生态红线与永久基本农田可叠在同一地块） | `S_original` = **输入面自身面积**（椭球面积，只算一次）；同时输出 `sum_overlap_area`、`ratio_of_original`（封顶 100%）与 `union_overlap_area`、`ratio_union`（先 union 再算，用于「严重压盖」判定） |
-| 2 | `GetArea()` 直接算 | 在 EPSG:4490（度）下得到的是**平方度**，不是平方米；用 Web 墨卡托则高纬误差可达数倍 | 统一 `osr` 投影到 **Albers 等积（EPSG:9822 / 以区域中心自定义）** 计算面积，同时用 GDAL 椭球公式（`OGR_GEOM_AREA_ELLIPSOID`）交叉校验 |
-| 3 | Shapefile 存全国红线 | `.shp` 单文件 2GB 上限、字段名 10 字符、无空间索引时遍历全省 | GeoPackage / FlatGeobuf（自带 R 树索引），`SetSpatialFilter(bbox)` 先粗筛，再精算 |
-| 4 | 只按 bbox 判断省份 | bbox 跨省但实际面只在其中一个省，会多拆任务；反之边界处会漏 | bbox 预筛 → **省份包围盒 + 实际几何 `Intersects`** 双重判断 |
-| 5 | 消息体只带图斑 ID | 计算节点拿不到**输入面几何**，无法相交 | 消息体带 `batch_id / task_id / province_code / input_wkt / params`，几何走 WKT 传（也可换成对象存储 key） |
-| 6 | 「必要时缓冲」 | 红线数据在省界被裁剪，压盖区域正好骑在省界上时两边各算一半，容易漏 | 计算时对红线**按 `buffer_m` 外扩**（默认 50m，可配），汇总时再对重叠结果做 union 去重 |
+1. **统一坐标到 CGCS2000 地理坐标**（EPSG:4490），上游输入可能是 WGS84 / Web Mercator / 高斯投影
+2. **投影到以区域中心为基准的 Albers 等积圆锥投影**（标准纬线 ±3°）算面积，误差 < 0.01%
+3. **pyproj Karney 椭球面积交叉校验**，差异 > 0.5% 说明投影参数或数据基准有问题
+4. **并集口径 vs 相加口径**：跨省时同一块压盖被两侧各算一次，`union` 去重后才是真实压盖面积
 
-另外补充原方案缺的两件事：
-- **幂等与容错**：每个子任务 `task_id` 唯一，主节点按批次去重；worker 失败消息进死信队列；同一批次可重投。
-- **超时兜底**：`wait_timeout` 到期即返回「部分结果」，前端能看到哪些省还没回来，而不是挂死。
-
-## 3. 目录结构
+## 目录结构
 
 ```
-core/                核心算法（单机版，无 MQ 依赖）
-  geo.py             坐标统一 / 等积面积 / 缓冲
-  province.py        动态省份识别
-  overlay.py         相交计算
-  redline_index.py   GPKG + R 树 数据访问
-  quickstart.py      单文件入口
-app/
-  config.py         配置（数据目录、RabbitMQ、阈值、缓冲距离）
-  geo.py            坐标统一 / 面积计算 / 几何工具
-  province.py       动态省份识别
-  redline_index.py  红线数据访问（OGR + 空间索引）
-  overlay.py        相交计算核心
-  topology.py       MQ 拓扑（fanout + 独占队列、死信）
-  publisher.py      任务分发 + 结果回传
-  worker.py         计算节点
-  aggregator.py     结果汇总 + 合规判定（幂等）
-  main.py           主节点 API + 静态页
-web/index.html      前端（Leaflet 画框 + 结果表格 + 压盖渲染）
-scripts/
-  bootstrap.sh      环境初始化
-  gen_data.py       生成演示红线数据（北京/河北真实边界侧区域）
-  build_index.py    构建空间索引、省份边界包
-  e2e_test.py       端到端用例（跨省/省内/压盖/不压盖）
-docs/
-  需求分析与方案评审.md
+main.py                    统一入口（role=all/master/slave）
+config.ini                 配置文件（env > ini > 默认值）
+ophub/
+  config.py                configparser 加载 config.ini
+  mq.py                    共享队列拓扑（topic exchange + 死信）
+  store.py                 SQLite 持久化（tasks + subtasks，WAL 模式）
+  scanner.py               省份识别 + 按省拆任务（调用 core.province）
+  calculator.py            单省红线计算入口（调用 core.overlay）
+  master.py                FastAPI + TaskProducer + 结果回收线程
+  slave.py                 共享队列消费者（prefetch=1，失败重试）
+core/                      计算核心（单机/分布式共用）
+  geo.py                   坐标统一 / 等积面积 / 缓冲 / 椭球校验
+  province.py              动态省份识别（bbox 预筛 + 几何相交）
+  overlay.py               面-面叠加（逐图斑相交 → Union → 面积）
+  redline_index.py         GPKG + R 树空间索引（SetSpatialFilter 粗筛）
+  quickstart.py            单文件入口：串行跑完所有省，调试最快
+  _config.py               core 内部数据路径配置
+data/                      红线数据（按省 GPKG，文件名=行政区划代码）
+scripts/                   gen_data.py 等开发工具（import 已过期，见下方）
+tests/                     e2e_test.py（需要 RabbitMQ）
+web/                       前端 Leaflet 地图（http://127.0.0.1:8001/）
 ```
 
-## 4. 数据契约
+## 配置
 
-全国红线数据集按省一个图层（或一个文件），字段固定：
+`config.ini`（所有字段都有默认值，按需改）：
+
+| 分组 | 字段 | 说明 |
+|---|---|---|
+| 角色 | `role` | `all` / `master` / `slave`，也可命令行覆盖 `python main.py slave` |
+| 业务 | `severe_ratio` | 严重压盖阈值（默认 0.5） |
+| | `buffer_m` | 红线缓冲距离（默认 50m，吃省界裁剪缝隙） |
+| MQ | `rabbitmq_host/port/user/password` | RabbitMQ 连接 |
+| | `task_routing_key` / `result_routing_key` | 消息路由键（主/从必须一致） |
+| | `prefetch_count` | 1 = 公平分发，长任务不并发 |
+| | `task_max_retries` | 单任务失败重试次数，超上限进死信队列 |
+| 持久化 | `db_path` | SQLite 文件，默认 `tasks.db`（WAL 模式） |
+
+环境变量同名可覆盖（部署时方便）：`RABBITMQ_HOST`、`ROLE`、`SEVERE_RATIO` 等。
+
+## 数据契约
+
+红线按省一个 GPKG：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `fid` | string | 图斑唯一标识 |
+| `patch_id` | string | 图斑唯一标识（字段名自动识别 patch_id / fid / ID / OBJECTID） |
 | `type` | string | 红线类型：`生态保护红线` / `永久基本农田` / `城镇开发边界` |
-| `province` | string | 省级行政区名称 |
-| `geometry` | Polygon/MultiPolygon | CGCS2000 经纬度 |
+| `geometry` | Polygon / MultiPolygon | CGCS2000 经纬度 |
 
-当前演示数据目录：`data/redline/{省名}.gpkg`。
+演示数据位于 `data/redline/{110000,120000,130000,140000,370000,410000}.gpkg`（京津冀鲁晋豫）。
 
-## 5. API
+## API
 
-`POST /api/v1/overlay/analyze`
+### `POST /overlay/analyze`
+
+下发叠加分析任务。MQ 模式立即返回 batch_id，前端轮询结果。
 
 ```json
 {
@@ -125,29 +122,73 @@ docs/
   "geometry": {"type": "Polygon", "coordinates": [[[116.2,39.0],[116.9,39.0],[116.9,39.6],[116.2,39.6],[116.2,39.0]]]},
   "geometry_srid": 4326,
   "severe_ratio": 0.5,
-  "buffer_m": 50,
-  "wait_timeout": 30
+  "buffer_m": 50
 }
 ```
 
-返回：见 `docs/需求分析与方案评审.md` 的「输出样例」。
+返回（MQ 模式，包含 summary 需调 `/overlay/result`）：
 
-`GET /api/v1/overlay/jobs/{batch_id}` 查批次全量结果；`GET /healthz` 探活；`GET /api/v1/provinces` 省份列表。
-
-## 6. 验证
-
-```bash
-/usr/bin/python3 tests/e2e_test.py
+```json
+{"success": true, "msg": null, "data": {
+  "batch_id": "B20261020161146-812d1347",
+  "dispatch_mode": "mq",
+  "subtask_count": 3,
+  "provinces": [{"code":"110000","name":"北京市"}, {"code":"130000","name":"河北省"}]
+}}
 ```
 
-覆盖：单省压盖、跨省压盖、完全不压盖、几何跨省但实际只在一个省（不应多拆任务）、大面覆盖多省、坐标错误输入。
+本地模式（`dispatch_mode=local`）在 POST 内直接算完，`data` 就是完整汇总结果。
 
-## 7. 生产化还需补的
+### `GET /overlay/result?batchId=xxx`
 
-演示跑得通 ≠ 能上生产，这几块是刻意没做的：
+聚合 SQLite 中已完成的子任务，返回完整汇总：
 
-1. **RabbitMQ 高可用**：镜像队列 / Quorum 队列 + 集群。
-2. **结果持久化**：现在在内存（带 TTL）。生产应写 PG + `batch_id/task_id` 唯一索引，天然幂等。
-3. **对象存储**：几何用 WKT 直传只适合小面（大面 WKT 可能几 MB）。生产走 OSS/MinIO 传 `key`。
-4. **National 数据**：`data/province/` 用的是简化后的省级边界（约 1km 精度），**不能直接用于合规判定**。生产必须替换为自然资源部门下发的标准行政区划（含省界争议处理）。
-5. **红线数据时效**：需建置数据版本号，分析结果要记录用了哪一版红线（合规结论要可追溯）。
+```json
+{"success": true, "msg": null, "data": {
+  "batch_id": "B...",
+  "status": "done",              // done / aggregating / failed
+  "severity": "SEVERE",           // CLEAR / OCCUPIED / SEVERE / OUTSIDE
+  "is_compliant": false,
+  "input_area_m2": 822119476.28,
+  "union_overlap_area_m2": 822194460.35,
+  "overlap_ratio_union": 100.0,
+  "provinces": [
+    {"province_code":"110000","province_name":"北京市","status":"success",
+     "patch_count":2,"patches_scanned":1200,"worker_id":"slave-bogon-35755",
+     "elapsed_ms":123.4}
+  ],
+  "patches": [...],          // 按 patch_id 跨省合并的明细
+  "by_type": [...],          // 按红线类型汇总
+  "overlap_geometry": {...}, // 全部压盖的并集 GeoJSON
+  "task_summary": {"expected":3,"succeeded":2,"no_data":0,"failed":0,"pending":1}
+}}
+```
+
+### 其他接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 健康检查 |
+| GET | `/overlay/result?batchId=xxx` | 任务结果（见上） |
+| GET | `/tasks/pending` | 全局待处理任务列表 |
+| GET | `/tasks/pending?batchId=xxx` | 指定任务的子任务进度 |
+| GET | `/nodes` | 当前连接的 Slave 消费者（调 RabbitMQ Management API） |
+| GET | `/provinces` | 支持的省份列表 |
+
+## 验证
+
+```bash
+conda run -n gis python3 core/quickstart.py    # 单机串行，秒级出结果
+conda run -n gis python3 tests/e2e_test.py      # 端到端（需 RabbitMQ）
+```
+
+## 生产化注意
+
+演示跑通 ≠ 能上生产，这几块刻意没做：
+
+1. **持久化用 SQLite**——单文件 WAL，几百万任务后需换 PG，`batch_id/task_id` 唯一索引天然幂等
+2. **RabbitMQ 单点**——镜像队列 / Quorum 队列 + 集群
+3. **红线数据版本管理**——结果要记录用了哪版红线，合规结论要可追溯
+4. **省份边界是简化数据**——约 1km 精度，生产替换为自然资源部标准行政区划
+5. **坐标系审计**——每步坐标变换要可回溯（CGCS2000 → Albers → ...）
+6. **消息体 WKT 直传**——大面几 MB，生产走 OSS/MinIO 传 key

@@ -11,7 +11,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from app import geo, province  # noqa: E402
+from core import geo, province  # noqa: E402
 
 CASES = {
     "A_廊坊大城_压城镇边界": [[116.55, 39.30], [116.80, 39.30], [116.80, 39.45], [116.55, 39.45]],

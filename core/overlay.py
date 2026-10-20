@@ -13,9 +13,9 @@ from typing import Optional
 
 from osgeo import ogr
 
-import geo
-from _config import settings
-from redline_index import RedlineStore
+from . import geo
+from ._config import settings
+from .redline_index import RedlineStore
 
 ogr.UseExceptions()
 
