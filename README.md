@@ -60,7 +60,9 @@ python main.py slave        # 终端 B：起计算节点（多开几个自动分
 ```
 main.py                    统一入口（role=all/master/slave）
 config.ini                 配置文件（env > ini > 默认值）
+requirements.txt           依赖清单（osgeo 走 conda 安装）
 ophub/
+  __init__.py
   config.py                configparser 加载 config.ini
   mq.py                    共享队列拓扑（topic exchange + 死信）
   store.py                 SQLite 持久化（tasks + subtasks，WAL 模式）
@@ -69,16 +71,16 @@ ophub/
   master.py                FastAPI + TaskProducer + 结果回收线程
   slave.py                 共享队列消费者（prefetch=1，失败重试）
 core/                      计算核心（单机/分布式共用）
+  __init__.py              Python 包标记
   geo.py                   坐标统一 / 等积面积 / 缓冲 / 椭球校验
   province.py              动态省份识别（bbox 预筛 + 几何相交）
   overlay.py               面-面叠加（逐图斑相交 → Union → 面积）
   redline_index.py         GPKG + R 树空间索引（SetSpatialFilter 粗筛）
-  quickstart.py            单文件入口：串行跑完所有省，调试最快
   _config.py               core 内部数据路径配置
 data/                      红线数据（按省 GPKG，文件名=行政区划代码）
-scripts/                   gen_data.py 等开发工具（import 已过期，见下方）
 tests/                     e2e_test.py（需要 RabbitMQ）
 web/                       前端 Leaflet 地图（http://127.0.0.1:8001/）
+docs/                      需求评审文档 + 截图
 ```
 
 ## 配置
@@ -178,8 +180,8 @@ web/                       前端 Leaflet 地图（http://127.0.0.1:8001/）
 ## 验证
 
 ```bash
-conda run -n gis python3 core/quickstart.py    # 单机串行，秒级出结果
 conda run -n gis python3 tests/e2e_test.py      # 端到端（需 RabbitMQ）
+# 单机算法验证：python main.py 后用 web/index.html 交互测试
 ```
 
 ## 生产化注意
