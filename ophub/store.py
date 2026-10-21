@@ -1,4 +1,8 @@
-"""SQLite 持久化存储层：主任务（batch）与子任务（按省 task）状态落库。
+"""SQLite 持久化存储层：主任务（task）与子任务（sub，按省）状态落库。
+
+命名对齐 op-hub 模板：
+- 主任务：tasks.task_id（对外 taskId）
+- 子任务：subtasks.sub_id（对外 subId），值形如 "<task_id>:<province_code>"
 
 设计要点：
 - 单连接 + 互斥锁：结果回收线程写、REST 接口读，量级很小，串行化足够
@@ -38,7 +42,7 @@ def init_db() -> str:
             _conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
-                    batch_id      TEXT PRIMARY KEY,
+                    task_id       TEXT PRIMARY KEY,
                     feature_id    TEXT NOT NULL,
                     input_wkt     TEXT NOT NULL,
                     input_area_m2 REAL NOT NULL,
@@ -51,8 +55,8 @@ def init_db() -> str:
                     UNIQUE(feature_id, input_wkt)
                 );
                 CREATE TABLE IF NOT EXISTS subtasks (
-                    task_id          TEXT PRIMARY KEY,
-                    batch_id         TEXT NOT NULL REFERENCES tasks(batch_id),
+                    sub_id           TEXT PRIMARY KEY,
+                    task_id          TEXT NOT NULL REFERENCES tasks(task_id),
                     province_code    TEXT NOT NULL,
                     province_name    TEXT NOT NULL,
                     status           TEXT NOT NULL DEFAULT 'pending',  -- pending / success / no_data / failed
@@ -60,9 +64,9 @@ def init_db() -> str:
                     error            TEXT,
                     finished_at      TEXT,
                     published        INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(batch_id, province_code)
+                    UNIQUE(task_id, province_code)
                 );
-                CREATE INDEX IF NOT EXISTS idx_subtasks_batch ON subtasks(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(task_id);
                 CREATE INDEX IF NOT EXISTS idx_subtasks_status ON subtasks(status);
                 """
             )
@@ -71,7 +75,7 @@ def init_db() -> str:
 
 
 def save_task(
-    batch_id: str,
+    task_id: str,
     feature_id: str,
     input_wkt: str,
     input_area_m2: float,
@@ -80,24 +84,24 @@ def save_task(
     provinces: list[dict],
     created_at: str,
 ) -> list[str]:
-    """保存主任务 + 全部子任务，返回子任务 task_id 列表。"""
-    sub_ids = [f"{batch_id}:{p['code']}" for p in provinces]
+    """保存主任务 + 全部子任务，返回子任务 sub_id 列表。"""
+    sub_ids = [f"{task_id}:{p['code']}" for p in provinces]
     with _lock:
         _conn.execute(
             """
-            INSERT INTO tasks (batch_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio, provinces, created_at)
+            INSERT INTO tasks (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio, provinces, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (batch_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio,
+            (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio,
              json.dumps(provinces, ensure_ascii=False), created_at),
         )
         _conn.executemany(
             """
-            INSERT INTO subtasks (task_id, batch_id, province_code, province_name)
+            INSERT INTO subtasks (sub_id, task_id, province_code, province_name)
             VALUES (?, ?, ?, ?)
             """,
             [
-                (sub_ids[i], batch_id, provinces[i]["code"], provinces[i]["name"])
+                (sub_ids[i], task_id, provinces[i]["code"], provinces[i]["name"])
                 for i in range(len(provinces))
             ],
         )
@@ -111,58 +115,58 @@ def mark_published(sub_ids: list[str]) -> None:
         return
     with _lock:
         _conn.executemany(
-            "UPDATE subtasks SET published = 1 WHERE task_id = ?",
+            "UPDATE subtasks SET published = 1 WHERE sub_id = ?",
             [(s,) for s in sub_ids],
         )
         _conn.commit()
 
 
-def fail_unpublished(batch_id: str, error: str, finished_at: str) -> None:
-    """投递失败：该批次中尚未投递的 pending 子任务全部置为 failed。"""
+def fail_unpublished(task_id: str, error: str, finished_at: str) -> None:
+    """投递失败：该任务中尚未投递的 pending 子任务全部置为 failed。"""
     with _lock:
         _conn.execute(
             "UPDATE subtasks SET status = 'failed', error = ?, finished_at = ? "
-            "WHERE batch_id = ? AND status = 'pending' AND published = 0",
-            (error, finished_at, batch_id),
+            "WHERE task_id = ? AND status = 'pending' AND published = 0",
+            (error, finished_at, task_id),
         )
         _conn.execute(
-            "UPDATE tasks SET status = 'failed' WHERE batch_id = ?", (batch_id,),
+            "UPDATE tasks SET status = 'failed' WHERE task_id = ?", (task_id,),
         )
         _conn.commit()
 
 
-def update_subtask(task_id: str, status: str, result_json: str | None, error: str | None, finished_at: str) -> bool:
+def update_subtask(sub_id: str, status: str, result_json: str | None, error: str | None, finished_at: str) -> bool:
     """结果回传：更新子任务状态。返回是否命中（False=库中无此子任务）。"""
     with _lock:
         cur = _conn.execute(
-            "UPDATE subtasks SET status = ?, result_json = ?, error = ?, finished_at = ? WHERE task_id = ?",
-            (status, result_json, error, finished_at, task_id),
+            "UPDATE subtasks SET status = ?, result_json = ?, error = ?, finished_at = ? WHERE sub_id = ?",
+            (status, result_json, error, finished_at, sub_id),
         )
         _conn.commit()
     return cur.rowcount > 0
 
 
-def update_task_summary(batch_id: str, status: str, summary_json: str) -> None:
+def update_task_summary(task_id: str, status: str, summary_json: str) -> None:
     """全部子任务完成或超时后，写入最终汇总结果。"""
     with _lock:
         _conn.execute(
-            "UPDATE tasks SET status = ?, summary = ? WHERE batch_id = ?",
-            (status, summary_json, batch_id),
+            "UPDATE tasks SET status = ?, summary = ? WHERE task_id = ?",
+            (status, summary_json, task_id),
         )
         _conn.commit()
 
 
-def get_task(batch_id: str) -> dict | None:
+def get_task(task_id: str) -> dict | None:
     """取主任务 + 全部子任务。"""
     with _lock:
         trow = _conn.execute(
-            "SELECT * FROM tasks WHERE batch_id = ?", (batch_id,)
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
         ).fetchone()
         if trow is None:
             return None
         srows = _conn.execute(
-            "SELECT * FROM subtasks WHERE batch_id = ? ORDER BY province_code",
-            (batch_id,),
+            "SELECT * FROM subtasks WHERE task_id = ? ORDER BY province_code",
+            (task_id,),
         ).fetchall()
     task = dict(trow)
     task["provinces"] = json.loads(task["provinces"]) if task.get("provinces") else []
@@ -175,15 +179,15 @@ def get_pending_tasks() -> list[dict]:
     with _lock:
         rows = _conn.execute(
             """
-            SELECT t.batch_id, t.feature_id, t.created_at,
+            SELECT t.task_id, t.feature_id, t.created_at,
                    COUNT(*)                           AS total,
                    SUM(s.status = 'pending')          AS pending_count,
                    SUM(s.status IN ('success','no_data')) AS finished_count,
                    SUM(s.status = 'failed')           AS failed_count
-            FROM tasks t JOIN subtasks s ON s.batch_id = t.batch_id
-            GROUP BY t.batch_id
+            FROM tasks t JOIN subtasks s ON s.task_id = t.task_id
+            GROUP BY t.task_id
             HAVING pending_count > 0
-            ORDER BY t.created_at, t.batch_id
+            ORDER BY t.created_at, t.task_id
             """
         ).fetchall()
     return [dict(r) for r in rows]
@@ -193,7 +197,7 @@ def get_unpublished_pending_subtasks() -> list[dict]:
     """重启恢复用：已落库但未成功投递的 pending 子任务。"""
     with _lock:
         rows = _conn.execute(
-            "SELECT task_id, batch_id, province_code, province_name FROM subtasks "
+            "SELECT sub_id, task_id, province_code, province_name FROM subtasks "
             "WHERE status = 'pending' AND published = 0 ORDER BY rowid"
         ).fetchall()
     return [dict(r) for r in rows]

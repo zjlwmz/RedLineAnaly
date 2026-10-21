@@ -2,8 +2,8 @@
 
 任务消息体：
   {
-    "task_id": "<batch_id>:<province_code>",
-    "batch_id": "...",
+    "task_id": "<主任务 ID>",
+    "sub_id": "<task_id>:<province_code>",
     "feature_id": "...",
     "province_code": "...",
     "province_name": "...",
@@ -16,7 +16,7 @@
 
 结果消息体（success / no_data）：
   {
-    "task_id": "...", "batch_id": "...",
+    "task_id": "...", "sub_id": "...",
     "province_code": "...", "province_name": "...",
     "status": "success|no_data",
     "patch_count": 3, "patches_scanned": 1200,
@@ -61,7 +61,7 @@ def _publish_result(channel: pika.channel.Channel, result: dict) -> None:
         properties=pika.BasicProperties(
             content_type="application/json",
             delivery_mode=2,
-            message_id=result.get("task_id") or result["batch_id"],
+            message_id=result.get("sub_id") or result["task_id"],
         ),
     )
 
@@ -75,41 +75,41 @@ def _make_callback(channel: pika.channel.Channel):
             ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        batch_id = task.get("batch_id", "unknown")
-        task_id = task.get("task_id", batch_id)
+        task_id = task.get("task_id", "unknown")
+        sub_id = task.get("sub_id")
         province_code = task.get("province_code")
         province_name = task.get("province_name", province_code)
         headers = dict(properties.headers or {})
         retries = int(headers.get("x-retries", 0))
         logger.info(
-            "Received task %s (attempt %s): batch=%s province=%s(%s)",
-            task_id, retries + 1, batch_id, province_name, province_code,
+            "Received subtask %s (attempt %s): task=%s province=%s(%s)",
+            sub_id, retries + 1, task_id, province_name, province_code,
         )
 
-        if not province_code or not task.get("input_wkt"):
-            logger.error("Task %s missing province_code or input_wkt, reject to DLQ", task_id)
+        if not province_code or not task.get("input_wkt") or not sub_id:
+            logger.error("Subtask %s missing sub_id/province_code/input_wkt, reject to DLQ", sub_id)
             ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
             return
 
         try:
             result = run_task(task)
-            # run_task 返回的是 overlay_province 的结果（缺 batch_id/task_id/worker_id），补上
+            # run_task 返回的是 overlay_province 的结果（缺 task_id/sub_id/worker_id），补上
             result.update({
-                "batch_id": batch_id,
                 "task_id": task_id,
+                "sub_id": sub_id,
                 "worker_id": _WORKER_ID,
                 "status": result.get("status", "success"),
             })
             _publish_result(ch, result)
             ch.basic_ack(delivery_tag=method.delivery_tag)
             logger.info(
-                "Task %s done: %s(%s) status=%s patches=%s elapsed=%sms",
-                task_id, province_name, province_code,
+                "Subtask %s done: %s(%s) status=%s patches=%s elapsed=%sms",
+                sub_id, province_name, province_code,
                 result["status"], result.get("patch_count", 0), result.get("elapsed_ms", 0),
             )
             return
         except Exception as exc:
-            logger.exception("Task %s failed on attempt %s", task_id, retries + 1)
+            logger.exception("Subtask %s failed on attempt %s", sub_id, retries + 1)
             error = f"{type(exc).__name__}: {exc}"
 
         # ---- 失败处理：未超上限则带计数重新投递，超过上限进死信队列 ----
@@ -123,18 +123,18 @@ def _make_callback(channel: pika.channel.Channel):
                     properties=pika.BasicProperties(
                         content_type="application/json",
                         delivery_mode=2,
-                        message_id=task_id,
+                        message_id=sub_id,
                         headers=headers,
                     ),
                 )
-                logger.info("Task %s re-queued (retry %s/%s)", task_id, retries + 1, settings.task_max_retries)
+                logger.info("Subtask %s re-queued (retry %s/%s)", sub_id, retries + 1, settings.task_max_retries)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
             else:
-                logger.error("Task %s exceeded max retries, send to DLQ: %s(%s)",
-                             task_id, province_name, province_code)
+                logger.error("Subtask %s exceeded max retries, send to DLQ: %s(%s)",
+                             sub_id, province_name, province_code)
                 _publish_result(ch, {
-                    "batch_id": batch_id,
                     "task_id": task_id,
+                    "sub_id": sub_id,
                     "province_code": province_code,
                     "province_name": province_name,
                     "status": "failed",
@@ -147,7 +147,7 @@ def _make_callback(channel: pika.channel.Channel):
                 })
                 ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
         except (pika.exceptions.AMQPError, OSError):
-            logger.exception("Failed to publish retry/result for task %s, nack requeue", task_id)
+            logger.exception("Failed to publish retry/result for subtask %s, nack requeue", sub_id)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     return on_task

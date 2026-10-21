@@ -41,7 +41,7 @@ python main.py slave        # 终端 B：起计算节点（多开几个自动分
               │ result.redline.overlay        │
               └───────────────┬──────────────┘
                               ▼
-                     主节点结果聚合（batch_id + task_id 去重）
+                     主节点结果聚合（子任务按 sub_id 幂等回写）
 ```
 
 共享队列 vs 原独占队列：同省任务任意 worker 都能处理，不需要「worker 发现」逻辑。MQ 不可用时 Master 自动降级本地串行。
@@ -80,7 +80,7 @@ core/                      计算核心（单机/分布式共用）
 data/                      红线数据（按省 GPKG，文件名=行政区划代码）
 tests/                     e2e_test.py（需要 RabbitMQ）
 web/                       前端 Leaflet 地图（http://127.0.0.1:8001/）
-docs/                      需求评审文档 + 截图
+docs/                      运行效果截图
 ```
 
 ## 配置
@@ -116,7 +116,7 @@ docs/                      需求评审文档 + 截图
 
 ### `POST /overlay/analyze`
 
-下发叠加分析任务。MQ 模式立即返回 batch_id，前端轮询结果。
+下发叠加分析任务。MQ 模式立即返回 task_id，前端用 `?taskId=` 轮询结果。
 
 ```json
 {
@@ -132,7 +132,7 @@ docs/                      需求评审文档 + 截图
 
 ```json
 {"success": true, "msg": null, "data": {
-  "batch_id": "B20261020161146-812d1347",
+  "task_id": "T20261020161146-812d1347",
   "dispatch_mode": "mq",
   "subtask_count": 3,
   "provinces": [{"code":"110000","name":"北京市"}, {"code":"130000","name":"河北省"}]
@@ -141,13 +141,13 @@ docs/                      需求评审文档 + 截图
 
 本地模式（`dispatch_mode=local`）在 POST 内直接算完，`data` 就是完整汇总结果。
 
-### `GET /overlay/result?batchId=xxx`
+### `GET /overlay/result?taskId=xxx`
 
 聚合 SQLite 中已完成的子任务，返回完整汇总：
 
 ```json
 {"success": true, "msg": null, "data": {
-  "batch_id": "B...",
+  "task_id": "T...",
   "status": "done",              // done / aggregating / failed
   "severity": "SEVERE",           // CLEAR / OCCUPIED / SEVERE / OUTSIDE
   "is_compliant": false,
@@ -171,9 +171,9 @@ docs/                      需求评审文档 + 截图
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
-| GET | `/overlay/result?batchId=xxx` | 任务结果（见上） |
+| GET | `/overlay/result?taskId=xxx` | 任务结果（见上） |
 | GET | `/tasks/pending` | 全局待处理任务列表 |
-| GET | `/tasks/pending?batchId=xxx` | 指定任务的子任务进度 |
+| GET | `/tasks/pending?taskId=xxx` | 指定任务的子任务进度 |
 | GET | `/nodes` | 当前连接的 Slave 消费者（调 RabbitMQ Management API） |
 | GET | `/provinces` | 支持的省份列表 |
 
@@ -188,7 +188,7 @@ conda run -n gis python3 tests/e2e_test.py      # 端到端（需 RabbitMQ）
 
 演示跑通 ≠ 能上生产，这几块刻意没做：
 
-1. **持久化用 SQLite**——单文件 WAL，几百万任务后需换 PG，`batch_id/task_id` 唯一索引天然幂等
+1. **持久化用 SQLite**——单文件 WAL，几百万任务后需换 PG，`sub_id` 主键天然幂等
 2. **RabbitMQ 单点**——镜像队列 / Quorum 队列 + 集群
 3. **红线数据版本管理**——结果要记录用了哪版红线，合规结论要可追溯
 4. **省份边界是简化数据**——约 1km 精度，生产替换为自然资源部标准行政区划

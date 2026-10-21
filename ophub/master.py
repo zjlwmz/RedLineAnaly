@@ -1,11 +1,11 @@
 """Master 节点：红线叠加分析算子的 REST 服务 + RabbitMQ 生产者 + 结果回收线程。
 
-对外接口：
+对外接口（标识命名对齐 op-hub 模板：主任务 taskId，子任务 subId）：
   GET  /health                                健康检查
-  POST /overlay/analyze                       下发叠加分析任务（返回 batch_id）
-  GET  /overlay/result?batchId=xxx            查询任务结果（含各子任务明细 + 汇总）
+  POST /overlay/analyze                       下发叠加分析任务（返回 taskId）
+  GET  /overlay/result?taskId=xxx             查询任务结果（含各子任务明细 + 汇总）
   GET  /tasks/pending                         全局待处理任务列表
-  GET  /tasks/pending?batchId=xxx             指定任务的子任务进度明细
+  GET  /tasks/pending?taskId=xxx              指定任务的子任务进度明细
   GET  /nodes                                 当前连接的 Slave 消费者列表
   GET  /provinces                             支持的省份列表
 
@@ -129,7 +129,7 @@ class TaskProducer:
                         properties=pika.BasicProperties(
                             content_type="application/json",
                             delivery_mode=2,
-                            message_id=message.get("task_id") or message.get("batch_id"),
+                            message_id=message.get("sub_id") or message["task_id"],
                         ),
                     )
                     return
@@ -160,21 +160,21 @@ def _result_consumer_loop() -> None:
             def on_result(ch: pika.channel.Channel, method, props, body: bytes) -> None:
                 try:
                     result = json.loads(body)
-                    task_id = result.get("task_id")
-                    if not task_id:
-                        logger.warning("Result without task_id ignored: %r", body)
+                    sub_id = result.get("sub_id")
+                    if not sub_id:
+                        logger.warning("Result without sub_id ignored: %r", body)
                         return
                     status = result.get("status", "unknown")
                     finished_at = datetime.now().isoformat(timespec="seconds")
                     error = result.get("error") if status == "failed" else None
                     updated = store.update_subtask(
-                        task_id, status, json.dumps(result, ensure_ascii=False) if status in ("success", "no_data") else None,
+                        sub_id, status, json.dumps(result, ensure_ascii=False) if status in ("success", "no_data") else None,
                         error, finished_at,
                     )
                     if updated:
-                        logger.info("Subtask %s -> %s", task_id, status)
+                        logger.info("Subtask %s -> %s", sub_id, status)
                     else:
-                        logger.warning("Result for unknown subtask %s ignored", task_id)
+                        logger.warning("Result for unknown subtask %s ignored", sub_id)
                 except Exception:
                     logger.exception("Failed to handle result message: %r", body)
                 finally:
@@ -197,9 +197,9 @@ def _result_consumer_loop() -> None:
 # --------------------------------------------------------------------------- #
 # 汇总逻辑（内嵌，避免再引入一个 aggregator.py）
 # --------------------------------------------------------------------------- #
-def _aggregate_task(batch_id: str) -> dict | None:
+def _aggregate_task(task_id: str) -> dict | None:
     """从 SQLite 读取子任务，合并成最终汇总结果。"""
-    task = store.get_task(batch_id)
+    task = store.get_task(task_id)
     if task is None:
         return None
 
@@ -306,7 +306,7 @@ def _aggregate_task(batch_id: str) -> dict | None:
         ))
 
     summary = {
-        "batch_id": task["batch_id"],
+        "task_id": task["task_id"],
         "feature_id": task.get("feature_id"),
         "input_area_m2": round(input_area, 2),
         "buffer_m": task["buffer_m"],
@@ -340,9 +340,9 @@ def _aggregate_task(batch_id: str) -> dict | None:
 
     # 全部完成则写回 summary
     if not pending:
-        store.update_task_summary(batch_id, "done", json.dumps(summary, ensure_ascii=False))
+        store.update_task_summary(task_id, "done", json.dumps(summary, ensure_ascii=False))
     else:
-        store.update_task_summary(batch_id, "aggregating", json.dumps(summary, ensure_ascii=False))
+        store.update_task_summary(task_id, "aggregating", json.dumps(summary, ensure_ascii=False))
 
     return summary
 
@@ -385,19 +385,19 @@ def _recovery_loop(snapshot: list[dict]) -> None:
             try:
                 producer.publish_task({
                     "task_id": sub["task_id"],
-                    "batch_id": sub["batch_id"],
+                    "sub_id": sub["sub_id"],
                     "province_code": sub["province_code"],
                     "province_name": sub["province_name"],
                     # 注意：恢复投递时 input_wkt/input_area_m2 等字段需要从主任务里重新取
                     # 这里暂不传（需要主任务上下文），由调用方在实际恢复时补充
                 })
-                store.mark_published([sub["task_id"]])
-                logger.info("Recovery: republished subtask %s (%s)", sub["task_id"], sub["province_name"])
+                store.mark_published([sub["sub_id"]])
+                logger.info("Recovery: republished subtask %s (%s)", sub["sub_id"], sub["province_name"])
                 break
             except Exception:
                 logger.exception(
                     "Recovery publish failed for subtask %s, retry in %ss",
-                    sub["task_id"], settings.reconnect_interval,
+                    sub["sub_id"], settings.reconnect_interval,
                 )
                 time.sleep(settings.reconnect_interval)
 
@@ -468,13 +468,13 @@ def analyze(req: AnalyzeRequest):
 
     # 2) 省份识别
     provinces = split_provinces(geom)
-    batch_id = f"B{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    task_id = f"T{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
     created_at = datetime.now().isoformat(timespec="seconds")
 
     # 无命中省份 → 直接返回 CLEAR
     if not provinces:
         summary = {
-            "batch_id": batch_id,
+            "task_id": task_id,
             "feature_id": req.feature_id,
             "input_area_m2": round(input_area_m2, 2),
             "buffer_m": buffer_m,
@@ -493,11 +493,11 @@ def analyze(req: AnalyzeRequest):
             "warnings": ["输入面未落在任何省级行政区范围内"],
             "generated_at": created_at,
         }
-        return _ok({"dispatch_mode": "none", "batch_id": batch_id, "summary": summary})
+        return _ok({"dispatch_mode": "none", "task_id": task_id, "summary": summary})
 
     # 3) 落库
     store.save_task(
-        batch_id=batch_id,
+        task_id=task_id,
         feature_id=req.feature_id,
         input_wkt=input_wkt,
         input_area_m2=input_area_m2,
@@ -509,7 +509,7 @@ def analyze(req: AnalyzeRequest):
 
     # 4) 尝试投递 MQ
     dispatch_mode = "mq"
-    sub_ids = [f"{batch_id}:{p['code']}" for p in provinces]
+    sub_ids = [f"{task_id}:{p['code']}" for p in provinces]
     use_local = req.prefer_local
     if not use_local:
         try:
@@ -523,7 +523,7 @@ def analyze(req: AnalyzeRequest):
         store.mark_published(sub_ids)
         redline_store = RedlineStore()
         for p in provinces:
-            task_sub_id = f"{batch_id}:{p['code']}"
+            sub_id = f"{task_id}:{p['code']}"
             try:
                 result = overlay_province(
                     input_geom=geom,
@@ -535,25 +535,25 @@ def analyze(req: AnalyzeRequest):
                 )
                 finished_at = datetime.now().isoformat(timespec="seconds")
                 store.update_subtask(
-                    task_sub_id,
+                    sub_id,
                     result.get("status", "success"),
                     json.dumps(result, ensure_ascii=False),
                     None,
                     finished_at,
                 )
-                logger.info("Local subtask %s done: %s(%s)", task_sub_id, p["name"], p["code"])
+                logger.info("Local subtask %s done: %s(%s)", sub_id, p["name"], p["code"])
             except Exception as exc:
-                logger.exception("Local subtask %s failed: %s", task_sub_id, p["code"])
-                store.update_subtask(task_sub_id, "failed", None, f"{type(exc).__name__}: {exc}",
+                logger.exception("Local subtask %s failed: %s", sub_id, p["code"])
+                store.update_subtask(sub_id, "failed", None, f"{type(exc).__name__}: {exc}",
                                      datetime.now().isoformat(timespec="seconds"))
         dispatch_mode = "local"
     else:
         for i, p in enumerate(provinces):
-            task_sub_id = f"{batch_id}:{p['code']}"
+            sub_id = f"{task_id}:{p['code']}"
             try:
                 producer.publish_task({
-                    "batch_id": batch_id,
-                    "task_id": task_sub_id,
+                    "task_id": task_id,
+                    "sub_id": sub_id,
                     "feature_id": req.feature_id,
                     "province_code": p["code"],
                     "province_name": p["name"],
@@ -563,14 +563,14 @@ def analyze(req: AnalyzeRequest):
                     "buffer_m": buffer_m,
                     "severe_ratio": severe_ratio,
                 })
-                store.mark_published([task_sub_id])
+                store.mark_published([sub_id])
             except RuntimeError as exc:
-                store.fail_unpublished(batch_id, str(exc), datetime.now().isoformat(timespec="seconds"))
+                store.fail_unpublished(task_id, str(exc), datetime.now().isoformat(timespec="seconds"))
                 return _fail(503, str(exc))
 
-    logger.info("Task %s submitted: %s -> %s subtasks (%s)", batch_id, req.feature_id, len(provinces), dispatch_mode)
+    logger.info("Task %s submitted: %s -> %s subtasks (%s)", task_id, req.feature_id, len(provinces), dispatch_mode)
     return _ok({
-        "batch_id": batch_id,
+        "task_id": task_id,
         "dispatch_mode": dispatch_mode,
         "subtask_count": len(provinces),
         "provinces": provinces,
@@ -578,21 +578,21 @@ def analyze(req: AnalyzeRequest):
 
 
 @app.get("/overlay/result")
-def overlay_result(batchId: str = Query(..., alias="batchId", description="下发任务时返回的 batch_id")):
-    batch_id = (batchId or "").strip()
-    if not batch_id:
-        return _fail(400, "batchId 参数不能为空")
+def overlay_result(taskId: str = Query(..., alias="taskId", description="下发任务时返回的 task_id")):
+    task_id = (taskId or "").strip()
+    if not task_id:
+        return _fail(400, "taskId 参数不能为空")
 
-    task = store.get_task(batch_id)
+    task = store.get_task(task_id)
     if task is None:
-        return _fail(404, f"任务不存在: {batch_id}")
+        return _fail(404, f"任务不存在: {task_id}")
 
     # 如果全部子任务已完成且 summary 已写，直接返回
     if task["status"] == "done" and task.get("summary"):
         return _ok(json.loads(task["summary"]))
 
     # 重新聚合
-    summary = _aggregate_task(batch_id)
+    summary = _aggregate_task(task_id)
     return _ok(summary)
 
 
@@ -601,22 +601,22 @@ def overlay_result(batchId: str = Query(..., alias="batchId", description="下�
 # --------------------------------------------------------------------------- #
 @app.get("/tasks/pending")
 def tasks_pending(
-    batchId: str | None = Query(None, alias="batchId",
-                                description="可选。传入：该任务的子任务进度明细；不传：全局待处理列表"),
+    taskId: str | None = Query(None, alias="taskId",
+                               description="可选。传入：该任务的子任务进度明细；不传：全局待处理列表"),
 ):
-    batch_id = (batchId or "").strip()
+    task_id = (taskId or "").strip()
 
     # ---- 单任务模式 ----
-    if batch_id:
-        task = store.get_task(batch_id)
+    if task_id:
+        task = store.get_task(task_id)
         if task is None:
-            return _fail(404, f"任务不存在: {batch_id}")
+            return _fail(404, f"任务不存在: {task_id}")
         subs = task["subtasks"]
         pending = [s for s in subs if s["status"] == "pending"]
         ok = [s for s in subs if s["status"] in ("success", "no_data")]
         failed = [s for s in subs if s["status"] == "failed"]
         return _ok({
-            "batch_id": batch_id,
+            "task_id": task_id,
             "feature_id": task["feature_id"],
             "createdAt": task["created_at"],
             "total": len(subs),
@@ -625,7 +625,7 @@ def tasks_pending(
             "failedCount": len(failed),
             "subtasks": [
                 {
-                    "task_id": s["task_id"],
+                    "sub_id": s["sub_id"],
                     "province_code": s["province_code"],
                     "province_name": s["province_name"],
                     "status": s["status"],
