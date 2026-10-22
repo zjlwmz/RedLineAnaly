@@ -12,11 +12,15 @@
   已投递（published=1）的消息由 RabbitMQ 持久化保证不丢，无需重投。
 """
 import json
+import logging
 import os
 import sqlite3
 import threading
+from typing import Optional
 
 from ophub.config import BASE_DIR, settings
+
+logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
@@ -83,30 +87,41 @@ def save_task(
     severe_ratio: float,
     provinces: list[dict],
     created_at: str,
-) -> list[str]:
-    """保存主任务 + 全部子任务，返回子任务 sub_id 列表。"""
+) -> tuple[list[str], Optional[str]]:
+    """保存主任务 + 全部子任务，返回 (sub_ids, None)；
+    若 UNIQUE(feature_id, input_wkt) 冲突，返回 ([], existing_task_id) 表示幂等命中。"""
     sub_ids = [f"{task_id}:{p['code']}" for p in provinces]
     with _lock:
-        _conn.execute(
-            """
-            INSERT INTO tasks (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio, provinces, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio,
-             json.dumps(provinces, ensure_ascii=False), created_at),
-        )
-        _conn.executemany(
-            """
-            INSERT INTO subtasks (sub_id, task_id, province_code, province_name)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (sub_ids[i], task_id, provinces[i]["code"], provinces[i]["name"])
-                for i in range(len(provinces))
-            ],
-        )
-        _conn.commit()
-    return sub_ids
+        try:
+            _conn.execute(
+                """
+                INSERT INTO tasks (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio, provinces, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, feature_id, input_wkt, input_area_m2, buffer_m, severe_ratio,
+                 json.dumps(provinces, ensure_ascii=False), created_at),
+            )
+            _conn.executemany(
+                """
+                INSERT INTO subtasks (sub_id, task_id, province_code, province_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (sub_ids[i], task_id, provinces[i]["code"], provinces[i]["name"])
+                    for i in range(len(provinces))
+                ],
+            )
+            _conn.commit()
+            return sub_ids, None
+        except sqlite3.IntegrityError:
+            # 同 feature_id + 同几何已存在 → 幂等命中，返回旧 task_id
+            row = _conn.execute(
+                "SELECT task_id FROM tasks WHERE feature_id = ? AND input_wkt = ?",
+                (feature_id, input_wkt),
+            ).fetchone()
+            existing = row["task_id"] if row else None
+            logger.info("Duplicate submission (feature_id=%s) → existing task %s", feature_id, existing)
+            return [], existing
 
 
 def mark_published(sub_ids: list[str]) -> None:

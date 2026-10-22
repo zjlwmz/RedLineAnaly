@@ -377,29 +377,81 @@ if _WEB_DIR.exists():
 
 
 def _recovery_loop(snapshot: list[dict]) -> None:
+    """重启恢复：重新投递已落库但未成功发送 MQ 的 pending 子任务。
+
+    - 投递前从 store.get_task(sub.task_id) 读回 input_wkt/input_area_m2/buffer_m/severe_ratio，
+      保证 Slave 消费到完整消息（原来的代码只投 task_id/sub_id/province_code 等壳字段）。
+    - 先尝试一次 MQ 可达性；MQ 连不上则整体放弃本轮恢复（一条 warning），不做无限 while+sleep 刷日志。
+    - 单条投递有限重试（最多 settings.task_max_retries 次），仍失败则记日志跳过，不阻塞其他子任务。
+    """
     if not snapshot:
         return
     logger.info("Recovery: %s unpublished subtask(s) found, republishing ...", len(snapshot))
+
+    # 0) MQ 整体可达性预检查：连不上直接退出，避免无限刷日志
+    try:
+        producer._ensure_channel()
+    except Exception as exc:
+        logger.warning("Recovery skipped: RabbitMQ unreachable (%s). Subtasks stay pending in DB.", exc)
+        return
+
+    # 1) 批量取主任务字段（按 task_id 去重，避免同一主任务多次查库）
+    task_cache: dict[str, dict] = {}
+
+    def _load_main(task_id: str) -> dict | None:
+        if task_id not in task_cache:
+            task_cache[task_id] = store.get_task(task_id)
+        return task_cache[task_id]
+
+    republished = 0
+    skipped = 0
+    max_retries = settings.task_max_retries or 3
+
     for sub in snapshot:
-        while True:
+        main_task = _load_main(sub["task_id"])
+        if main_task is None:
+            logger.warning("Recovery: main task %s missing for subtask %s, skip", sub["task_id"], sub["sub_id"])
+            skipped += 1
+            continue
+
+        payload = {
+            "task_id": sub["task_id"],
+            "sub_id": sub["sub_id"],
+            "feature_id": main_task["feature_id"],
+            "province_code": sub["province_code"],
+            "province_name": sub["province_name"],
+            "input_wkt": main_task["input_wkt"],
+            "input_srid": 4490,
+            "input_area_m2": main_task["input_area_m2"],
+            "buffer_m": main_task["buffer_m"],
+            "severe_ratio": main_task["severe_ratio"],
+        }
+
+        ok = False
+        for attempt in range(max_retries):
             try:
-                producer.publish_task({
-                    "task_id": sub["task_id"],
-                    "sub_id": sub["sub_id"],
-                    "province_code": sub["province_code"],
-                    "province_name": sub["province_name"],
-                    # 注意：恢复投递时 input_wkt/input_area_m2 等字段需要从主任务里重新取
-                    # 这里暂不传（需要主任务上下文），由调用方在实际恢复时补充
-                })
+                producer.publish_task(payload)
                 store.mark_published([sub["sub_id"]])
                 logger.info("Recovery: republished subtask %s (%s)", sub["sub_id"], sub["province_name"])
+                republished += 1
+                ok = True
                 break
             except Exception:
-                logger.exception(
-                    "Recovery publish failed for subtask %s, retry in %ss",
-                    sub["sub_id"], settings.reconnect_interval,
-                )
-                time.sleep(settings.reconnect_interval)
+                if attempt + 1 < max_retries:
+                    logger.warning(
+                        "Recovery: publish failed for subtask %s (attempt %s/%s), retry in %ss",
+                        sub["sub_id"], attempt + 1, max_retries, settings.reconnect_interval,
+                    )
+                    time.sleep(settings.reconnect_interval)
+                else:
+                    logger.error(
+                        "Recovery: giving up on subtask %s after %s retries",
+                        sub["sub_id"], max_retries,
+                    )
+        if not ok:
+            skipped += 1
+
+    logger.info("Recovery done: republished=%s skipped=%s", republished, skipped)
 
 
 # 保存全部恢复需要的字段（恢复线程用）
@@ -496,7 +548,7 @@ def analyze(req: AnalyzeRequest):
         return _ok({"dispatch_mode": "none", "task_id": task_id, "summary": summary})
 
     # 3) 落库
-    store.save_task(
+    sub_ids, existing_task_id = store.save_task(
         task_id=task_id,
         feature_id=req.feature_id,
         input_wkt=input_wkt,
@@ -506,6 +558,39 @@ def analyze(req: AnalyzeRequest):
         provinces=provinces,
         created_at=created_at,
     )
+
+    if existing_task_id:
+        # 幂等命中：同 feature_id + 同几何已提交过，直接查旧任务状态
+        logger.info("Idempotent hit: reusing existing task %s (task_id=%s)", existing_task_id, task_id)
+        task = store.get_task(existing_task_id)
+        if task is None:
+            # 边界：被清掉了，退化成新建（不会走这里，唯一约束命中了就必然存在）
+            pass
+        elif task["status"] == "done" and task.get("summary"):
+            # 已完成 → 直接把 summary 塞回，dispatch_mode=local 让前端不再等
+            return _ok({
+                "task_id": existing_task_id,
+                "dispatch_mode": "local",
+                "subtask_count": len(task["subtasks"]),
+                "provinces": task["provinces"],
+                "summary": json.loads(task["summary"]),
+            })
+        elif task["status"] == "failed":
+            return _ok({
+                "task_id": existing_task_id,
+                "dispatch_mode": "existing",
+                "subtask_count": len(task["subtasks"]),
+                "provinces": task["provinces"],
+                "warnings": ["该输入面已有失败记录，task_id=" + existing_task_id],
+            })
+        else:
+            # pending / aggregating → 让前端继续轮询旧 task_id
+            return _ok({
+                "task_id": existing_task_id,
+                "dispatch_mode": "mq",
+                "subtask_count": len(task["subtasks"]),
+                "provinces": task["provinces"],
+            })
 
     # 4) 尝试投递 MQ
     dispatch_mode = "mq"
@@ -547,26 +632,36 @@ def analyze(req: AnalyzeRequest):
                 store.update_subtask(sub_id, "failed", None, f"{type(exc).__name__}: {exc}",
                                      datetime.now().isoformat(timespec="seconds"))
         dispatch_mode = "local"
-    else:
-        for i, p in enumerate(provinces):
-            sub_id = f"{task_id}:{p['code']}"
-            try:
-                producer.publish_task({
-                    "task_id": task_id,
-                    "sub_id": sub_id,
-                    "feature_id": req.feature_id,
-                    "province_code": p["code"],
-                    "province_name": p["name"],
-                    "input_wkt": input_wkt,
-                    "input_srid": 4490,
-                    "input_area_m2": input_area_m2,
-                    "buffer_m": buffer_m,
-                    "severe_ratio": severe_ratio,
-                })
-                store.mark_published([sub_id])
-            except RuntimeError as exc:
-                store.fail_unpublished(task_id, str(exc), datetime.now().isoformat(timespec="seconds"))
-                return _fail(503, str(exc))
+        summary = _aggregate_task(task_id)
+        logger.info("Task %s submitted: %s -> %s subtasks (%s)", task_id, req.feature_id, len(provinces), dispatch_mode)
+        return _ok({
+            "task_id": task_id,
+            "dispatch_mode": dispatch_mode,
+            "subtask_count": len(provinces),
+            "provinces": provinces,
+            "summary": summary,
+        })
+
+    # ---- MQ 分支 ----
+    for p in provinces:
+        sub_id = f"{task_id}:{p['code']}"
+        try:
+            producer.publish_task({
+                "task_id": task_id,
+                "sub_id": sub_id,
+                "feature_id": req.feature_id,
+                "province_code": p["code"],
+                "province_name": p["name"],
+                "input_wkt": input_wkt,
+                "input_srid": 4490,
+                "input_area_m2": input_area_m2,
+                "buffer_m": buffer_m,
+                "severe_ratio": severe_ratio,
+            })
+            store.mark_published([sub_id])
+        except RuntimeError as exc:
+            store.fail_unpublished(task_id, str(exc), datetime.now().isoformat(timespec="seconds"))
+            return _fail(503, str(exc))
 
     logger.info("Task %s submitted: %s -> %s subtasks (%s)", task_id, req.feature_id, len(provinces), dispatch_mode)
     return _ok({
