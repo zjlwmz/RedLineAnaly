@@ -43,6 +43,18 @@ def _to_list(value) -> list[str]:
 
 @dataclass(frozen=True)
 class Settings:
+    # CLCD 分析：源数据只读；分布式节点共用成果目录。
+    clcd_raster: str = _cfg("clcd_raster", "CLCD_RASTER", r"D:\data_work\suanzi\tif\CLCD_v01_1993_albert.tif", str)
+    admin_data_dir: str = _cfg("admin_data_dir", "ADMIN_DATA_DIR", r"D:\data_work\suanzi\base", str)
+    output_dir: str = _cfg("output_dir", "LANDCOVER_OUTPUT_DIR", r"D:\data_work\suanzi\out", str)
+    max_export_pixels: int = _cfg("max_export_pixels", "MAX_EXPORT_PIXELS", 0, int)
+    split_level: str = _cfg("split_level", "LANDCOVER_SPLIT_LEVEL", "county", str).lower()
+    # 多节点必须挂载同一成果目录，任务分配栅格与分块成果都存放在这里。
+    landcover_task_queue: str = _cfg("landcover_task_queue", "LANDCOVER_TASK_QUEUE", "landcover_task_queue", str)
+    landcover_result_queue: str = _cfg("landcover_result_queue", "LANDCOVER_RESULT_QUEUE", "landcover_result_queue", str)
+    landcover_dlx: str = _cfg("landcover_dlx", "LANDCOVER_DLX", "landcover_task_dlx", str)
+    landcover_dlq: str = _cfg("landcover_dlq", "LANDCOVER_DLQ", "landcover_task_dlq", str)
+
     # 节点角色：all / master / slave
     role: str = _cfg("role", "ROLE", "all", str).lower()
 

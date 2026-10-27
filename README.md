@@ -1,196 +1,93 @@
-# 国土图斑 × 全国红线叠加分析
+# 1993 年 CLCD 土地覆盖分析
 
-分布式红线压盖分析算子：**输入一个面 → 动态识别涉及省份 → RabbitMQ 共享队列分发 → 多节点并行 OGR 空间相交 → SQLite 幂等汇总 → 合规判定 + 地图渲染**。
+输入手绘面或省、市、县行政区域，统计区域内九类土地覆盖面积和占比，并导出裁剪 GeoTIFF 与分类面 GeoPackage。CLCD 任务采用原项目的 Master/Slave + RabbitMQ 分布式模式；旧版红线叠加 demo 代码仍保留在 `core/overlay.py`、`ophub/master.py` 等文件中。
 
-架构参考自 [op-hub](https://github.com/) 分布式算子模板（config.ini 配置、统一入口 role 分发、共享队列 + SQLite 持久化）。
+## 数据与配置
 
-## 快速开始
+- 栅格：`D:\data_work\suanzi\tif\CLCD_v01_1993_albert.tif`，单波段、30 米 Albers 等积投影、`0` 为 NoData。
+- 行政区：`D:\data_work\suanzi\base` 下的 `中国_省2.shp`、`中国_市2.shp`、`中国_县2.shp`。`name` 为名称，`gb` 为 9 位编码；原始 DBF 没有 `.cpg`，读取时明确使用 UTF-8。
+- `config.ini` 中的 `clcd_raster`、`admin_data_dir`、`output_dir`、`max_export_pixels` 可修改路径及任务规模；环境变量分别为 `CLCD_RASTER`、`ADMIN_DATA_DIR`、`LANDCOVER_OUTPUT_DIR`、`MAX_EXPORT_PIXELS`。当前 `output_dir = D:\data_work\suanzi\out`，`max_export_pixels = 0` 表示不按像元数拒绝省、市或手绘范围。
+- `split_level = province | city | county` 控制按省、市、县拆分；环境变量 `LANDCOVER_SPLIT_LEVEL` 可覆盖。每个任务记录提交时的拆分级别，修改配置不会改变已有任务。
+- `role = all | master | slave` 控制节点角色。`all` 运行 Web + 本机 Worker；RabbitMQ 不可用时自动在后台本机计算。`master` 只提供 Web、规划、投递、合并与成果下载，`slave` 只消费 CLCD 子任务。CLCD 使用独立持久化任务队列、结果队列和死信队列，不与旧红线 Worker 混用。
+- 多节点部署时，所有节点的 `clcd_raster` 必须指向内容和网格相同的栅格，`output_dir` 必须是所有节点可读写的**同一路径共享目录**（例如统一挂载的网络盘）。`db_path` 只由 Master 使用；各 Slave 无需共享 SQLite。RabbitMQ 地址与队列名称需一致。
+- `clcd_classes.json` 定义 `0` 和 `1–9` 的类别名称。分类依据应与数据发布方的 `CLCD_classificationsystem.xlsx` 保持一致。
 
-```bash
-conda activate gis          # 确保 GDAL / pyproj / pika / fastapi / pydantic 都在
+Python 依赖见 `requirements.txt`。GDAL 建议在 Conda 环境中安装，需与 Python 版本匹配；`requirements.txt` 不安装 GDAL。项目使用 `numpy`、`fastapi`、`uvicorn`、`pydantic`、`pika`。`tests/e2e_test.py` 是旧红线 demo 的测试，CLCD 计算与拆分测试为 `tests/test_landcover.py`、`tests/test_distributed_landcover.py`。
 
-# 1) 单节点跑通（推荐本地验证）
-python main.py              # config.ini 默认 role=all：Master + Slave 合一
-# → 打开 http://127.0.0.1:8001/ 点「载入示例」→「分析当前图斑」
+## 启动与 Web 测试
 
-# 2) 分布式跑
-docker run -d --name redline-rmq -p 5672:5672 rabbitmq:3-alpine
-python main.py master       # 终端 A：只起 REST 接口
-python main.py slave        # 终端 B：起计算节点（多开几个自动分担）
+首次在每台节点安装依赖：
+
+```powershell
+conda activate gis
+python -m pip install -r requirements.txt
 ```
 
-> **依赖说明**：GDAL Python 绑定（`osgeo`）建议 conda 安装（`conda install -c conda-forge gdal pyproj shapely`）。MQ 不可用时自动降级本地串行计算。
+RabbitMQ 可用时，在 **Master 的 PowerShell 窗口**启动 Web 服务和任务调度：
 
-## 架构
-
-```
-             ┌─────────────────────────────────────────────┐
-  前端地图    │  main.py (role=master)                       │
-  (Leaflet)  │  ├─ 坐标统一 → CGCS2000 / EPSG:4490          │
-   ──POST──▶ │  ├─ 省份识别（bbox 预筛 + 包围盒精确相交）     │
-             │  ├─ 按省拆 N 个子任务 → topic exchange 投递    │
-             │  ├─ SQLite 落库 + 恢复线程                    │
-             │  └─ 结果消费线程（更新 subtask.status）        │
-             └───────────────┬─────────────────────────────┘
-                             │ task.redline.calculate
-              ┌──────────────┴──────────────┐
-        ┌─────▼─────┐                 ┌─────▼─────┐
-        │ slave-1   │     ...         │ slave-N   │   共享 redline_task_queue
-        │ OGR 相交  │                 │ OGR 相交  │   prefetch=1 天然负载均衡
-        └─────┬─────┘                 └─────┬─────┘
-              │ result.redline.overlay        │
-              └───────────────┬──────────────┘
-                              ▼
-                     主节点结果聚合（子任务按 sub_id 幂等回写）
+```powershell
+conda activate gis
+$env:LANDCOVER_OUTPUT_DIR = 'D:\data_work\suanzi\out'
+python main.py master
 ```
 
-共享队列 vs 原独占队列：同省任务任意 worker 都能处理，不需要「worker 发现」逻辑。MQ 不可用时 Master 自动降级本地串行。
+在 **每台 Slave 各自的 PowerShell 窗口**启动计算节点；同一台机器也可以另开窗口启动多个 Slave：
 
-## 为什么面积计算要这么复杂
-
-绝大多数项目直接 `GetArea()` 得到的是**平方度**（EPSG:4490 经纬度坐标下），高纬误差可达数倍。本实现：
-
-1. **统一坐标到 CGCS2000 地理坐标**（EPSG:4490），上游输入可能是 WGS84 / Web Mercator / 高斯投影
-2. **投影到以区域中心为基准的 Albers 等积圆锥投影**（标准纬线 ±3°）算面积，误差 < 0.01%
-3. **pyproj Karney 椭球面积交叉校验**，差异 > 0.5% 说明投影参数或数据基准有问题
-4. **并集口径 vs 相加口径**：跨省时同一块压盖被两侧各算一次，`union` 去重后才是真实压盖面积
-
-## 目录结构
-
-```
-main.py                    统一入口（role=all/master/slave）
-config.ini                 配置文件（env > ini > 默认值）
-requirements.txt           依赖清单（osgeo 走 conda 安装）
-ophub/
-  __init__.py
-  config.py                configparser 加载 config.ini
-  mq.py                    共享队列拓扑（topic exchange + 死信）
-  store.py                 SQLite 持久化（tasks + subtasks，WAL 模式）
-  scanner.py               省份识别 + 按省拆任务（调用 core.province）
-  calculator.py            单省红线计算入口（调用 core.overlay）
-  master.py                FastAPI + TaskProducer + 结果回收线程
-  slave.py                 共享队列消费者（prefetch=1，失败重试）
-core/                      计算核心（单机/分布式共用）
-  __init__.py              Python 包标记
-  geo.py                   坐标统一 / 等积面积 / 缓冲 / 椭球校验
-  province.py              动态省份识别（bbox 预筛 + 几何相交）
-  overlay.py               面-面叠加（逐图斑相交 → Union → 面积）
-  redline_index.py         GPKG + R 树空间索引（SetSpatialFilter 粗筛）
-  _config.py               core 内部数据路径配置
-data/                      红线数据（按省 GPKG，文件名=行政区划代码）
-tests/                     e2e_test.py（需要 RabbitMQ）
-web/                       前端 Leaflet 地图（http://127.0.0.1:8001/）
-docs/                      运行效果截图
+```powershell
+conda activate gis
+$env:LANDCOVER_OUTPUT_DIR = 'D:\data_work\suanzi\out'
+python main.py slave
 ```
 
-## 配置
+Master 和 Slave 必须连接同一 RabbitMQ，并能读写同一份 `D:\data_work\suanzi\out` 目录、读取相同的 CLCD 栅格。多台机器上的 `D:` 若只是各自的本地磁盘，需要改用所有节点都能访问的同一路径共享目录。启动后可访问 `http://127.0.0.1:8001/health` 查看 Master 的 `output_dir`，Slave 启动日志也会打印实际目录。修改配置或代码后应重启已运行的节点；`LANDCOVER_OUTPUT_DIR` 会覆盖 `config.ini`。
 
-`config.ini`（所有字段都有默认值，按需改）：
+提交任务后，Master 控制台会记录子任务投递、结果接收与最终合并；每个 Slave 控制台会记录收到的任务 ID、分块编号、裁剪进度、矢量化进度及完成结果。日志中的 `pid` 和 `landcover-主机名-PID` 可用来区分节点。若 Slave 控制台只有 `consuming landcover_task_queue` 而没有 `accepted task`，说明该节点尚未取到任务。
 
-| 分组 | 字段 | 说明 |
-|---|---|---|
-| 角色 | `role` | `all` / `master` / `slave`，也可命令行覆盖 `python main.py slave` |
-| 业务 | `severe_ratio` | 严重压盖阈值（默认 0.5） |
-| | `buffer_m` | 红线缓冲距离（默认 50m，吃省界裁剪缝隙） |
-| MQ | `rabbitmq_host/port/user/password` | RabbitMQ 连接 |
-| | `task_routing_key` / `result_routing_key` | 消息路由键（主/从必须一致） |
-| | `prefetch_count` | 1 = 公平分发，长任务不并发 |
-| | `task_max_retries` | 单任务失败重试次数，超上限进死信队列 |
-| 持久化 | `db_path` | SQLite 文件，默认 `tasks.db`（WAL 模式） |
+打开 `http://127.0.0.1:8001/`，可选择省、市、县、导入 GeoJSON 文件或绘制面，点击“计算并导出”；页面轮询子任务进度，完成后下载成果。GeoJSON 支持 Polygon、MultiPolygon、Feature 及由多个面组成的 FeatureCollection，坐标须为 WGS84 经纬度；多个面会作为一个 MultiPolygon 范围计算。规划、从节点裁剪和主节点合并按固定大小的栅格块处理；Slave 还会各自矢量化分块，Master 最后合并分块 TIFF 和 GPKG。省级范围不再被 800 万像元上限拦截。范围越大，计算、矢量化所需时间和磁盘空间越多。本地没有 RabbitMQ 时，也可只运行 `python main.py all`，由同一进程在后台计算。
 
-环境变量同名可覆盖（部署时方便）：`RABBITMQ_HOST`、`ROLE`、`SEVERE_RATIO` 等。
+若旧 Slave 因读取旧目录而使任务失败，先停止旧 Slave、按上述命令重启节点，再在 PowerShell 中发送 **POST** 重试请求。浏览器地址栏打开该 URL 会发送 GET，不能触发重试：
 
-## 数据契约
+```powershell
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8001/landcover/retry/ffb3846272ae47e9af6059f014926ba9'
+```
 
-红线按省一个 GPKG：
+重试会复用原任务的 `plan.json` 和完整分块，只重新投递未成功的子任务。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `patch_id` | string | 图斑唯一标识（字段名自动识别 patch_id / fid / ID / OBJECTID） |
-| `type` | string | 红线类型：`生态保护红线` / `永久基本农田` / `城镇开发边界` |
-| `geometry` | Polygon / MultiPolygon | CGCS2000 经纬度 |
+## 计算口径
 
-演示数据位于 `data/redline/{110000,120000,130000,140000,370000,410000}.gpkg`（京津冀鲁晋豫）。
+1. 输入面从其 EPSG 坐标系转换到 CLCD 栅格自身的 Albers 投影，以栅格原始 30 米网格为准，不进行重采样。
+2. 像元中心落入面内时计入该像元。每个有效像元面积为 `30 × 30 = 900 m²`。`0` 不参与九类统计。
+3. `某类面积 = 该类有效像元数 × 900 m²`；`某类占比 = 某类有效像元数 ÷ 全部有效分类像元数 × 100%`。同时返回输入面面积、面内像元面积、NoData 面积和有效覆盖率。输入面真实面积与面内像元面积可能因边界像元选择而不同。
+4. 裁剪 GeoTIFF 保留原始类别值、颜色表、投影和 30 米网格，面外写成 NoData。GeoPackage 的 `landcover` 图层按相邻同类像元矢量化，字段为 `class_code`、`class_name`、`area_m2`。矢量边界是栅格像元边界，不是地籍地块边界。
+5. Master 按行政代码顺序把输入面内像元分配给子任务。行政边界重叠时像元归第一个行政区；行政区未覆盖的面内像元进入“行政区划空隙”子任务，避免重复或漏算。统计从合并后的 TIFF 计算；各 Slave 按同一像元口径生成分块 GPKG，Master 再合并为最终 GPKG。跨分块的连续同类斑块会保留分块边界。
 
-## API
+## 接口
 
-### `POST /overlay/analyze`
+| 方法 | 路径 | 用途 |
+|---|---|
+| GET | `/health` | 检查数据是否就绪 |
+| GET | `/landcover/regions?level=province\|city\|county&parent_code=...` | 获取行政区列表 |
+| GET | `/landcover/region-geometry?level=county&code=...` | 地图预览行政区几何 |
+| POST | `/landcover/analyze` | 持久化任务后立即返回 HTTP 202 和 `task_id`；行政区读取、拆分和投递在后台执行 |
+| GET | `/landcover/result/{task_id}` | 查询 `planning/pending/aggregating/done/failed` 状态、拆分级别、子任务进度、`created_at`、`finished_at`、`duration_seconds`；`done` 时包含最终 `result` |
+| POST | `/landcover/retry/{task_id}` | 使用原计划重试失败任务的未成功子任务 |
+| GET | `/landcover/download/{task_id}/raster` | 下载 GeoTIFF |
+| GET | `/landcover/download/{task_id}/vector` | 下载 GeoPackage |
 
-下发叠加分析任务。MQ 模式立即返回 task_id，前端用 `?taskId=` 轮询结果。
+手绘面请求示例：
 
 ```json
-{
-  "feature_id": "P-2024-0001",
-  "geometry": {"type": "Polygon", "coordinates": [[[116.2,39.0],[116.9,39.0],[116.9,39.6],[116.2,39.6],[116.2,39.0]]]},
-  "geometry_srid": 4326,
-  "severe_ratio": 0.5,
-  "buffer_m": 50
-}
+{"geometry":{"type":"Polygon","coordinates":[[[116.2,39.0],[116.3,39.0],[116.3,39.1],[116.2,39.1],[116.2,39.0]]]},"geometry_srid":4326}
 ```
 
-返回（MQ 模式，包含 summary 需调 `/overlay/result`）：
+行政区请求示例：
 
 ```json
-{"success": true, "msg": null, "data": {
-  "task_id": "T20261020161146-812d1347",
-  "dispatch_mode": "mq",
-  "subtask_count": 3,
-  "provinces": [{"code":"110000","name":"北京市"}, {"code":"130000","name":"河北省"}]
-}}
+{"region_level":"county","region_code":"156420704"}
 ```
 
-本地模式（`dispatch_mode=local`）在 POST 内直接算完，`data` 就是完整汇总结果。
+成功响应采用 `{ "success": true, "msg": null, "data": ... }`；最终结果中包含九类 `classes`、面积、占比以及两个下载链接。成果保存在 `D:\data_work\suanzi\out\<task_id>\`：裁剪栅格为 `CLCD_1993_clip.tif`，分类矢量为 `CLCD_1993_classes.gpkg`。同目录还保存任务计划、像元分配表、分块 TIFF/GPKG 和结果 JSON。新任务需重启所有 Master/Slave 才能按分块矢量化；修改前创建的任务仍使用原合并流程。
 
-### `GET /overlay/result?taskId=xxx`
+`/landcover/analyze` 返回 `{"success":true,"msg":null,"data":{"task_id":"..."}}` 后，可轮询结果接口。规划期间 `status=planning`、`total=0`；规划失败时 `status=failed` 并在 `error` 中说明原因。Master 在规划期间重启时，原任务会标为失败，需要重新提交。
 
-聚合 SQLite 中已完成的子任务，返回完整汇总：
-
-```json
-{"success": true, "msg": null, "data": {
-  "task_id": "T...",
-  "status": "done",              // done / aggregating / failed
-  "severity": "SEVERE",           // CLEAR / OCCUPIED / SEVERE / OUTSIDE
-  "is_compliant": false,
-  "input_area_m2": 822119476.28,
-  "union_overlap_area_m2": 822194460.35,
-  "overlap_ratio_union": 100.0,
-  "provinces": [
-    {"province_code":"110000","province_name":"北京市","status":"success",
-     "patch_count":2,"patches_scanned":1200,"worker_id":"slave-bogon-35755",
-     "elapsed_ms":123.4}
-  ],
-  "patches": [...],          // 按 patch_id 跨省合并的明细
-  "by_type": [...],          // 按红线类型汇总
-  "overlap_geometry": {...}, // 全部压盖的并集 GeoJSON
-  "task_summary": {"expected":3,"succeeded":2,"no_data":0,"failed":0,"pending":1}
-}}
-```
-
-### 其他接口
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/health` | 健康检查 |
-| GET | `/overlay/result?taskId=xxx` | 任务结果（见上） |
-| GET | `/tasks/pending` | 全局待处理任务列表 |
-| GET | `/tasks/pending?taskId=xxx` | 指定任务的子任务进度 |
-| GET | `/nodes` | 当前连接的 Slave 消费者（调 RabbitMQ Management API） |
-| GET | `/provinces` | 支持的省份列表 |
-
-## 验证
-
-```bash
-conda run -n gis python3 tests/e2e_test.py      # 端到端（需 RabbitMQ）
-# 单机算法验证：python main.py 后用 web/index.html 交互测试
-```
-
-## 生产化注意
-
-演示跑通 ≠ 能上生产，这几块刻意没做：
-
-1. **持久化用 SQLite**——单文件 WAL，几百万任务后需换 PG，`sub_id` 主键天然幂等
-2. **RabbitMQ 单点**——镜像队列 / Quorum 队列 + 集群
-3. **红线数据版本管理**——结果要记录用了哪版红线，合规结论要可追溯
-4. **省份边界是简化数据**——约 1km 精度，生产替换为自然资源部标准行政区划
-5. **坐标系审计**——每步坐标变换要可回溯（CGCS2000 → Albers → ...）
-6. **消息体 WKT 直传**——大面几 MB，生产走 OSS/MinIO 传 key
+`finished_at` 和 `duration_seconds` 在任务完成或失败后返回，时间使用 Master 本地时间。历史已完成任务没有数据库完成时间时，接口按 `result.json` 的文件修改时间估算，并将 `finished_at_estimated` 设为 `true`；历史失败任务若无可靠时间则保持 `null`。

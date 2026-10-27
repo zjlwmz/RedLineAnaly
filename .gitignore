@@ -9,6 +9,7 @@ env/
 
 # ---- 运行时产物 ----
 logs/
+outputs/
 *.log
 /tmp/
 .DS_Store
