@@ -1,0 +1,15 @@
+{
+  "year": 1993,
+  "nodata": 0,
+  "classes": [
+    {"code": 1, "name": "耕地"},
+    {"code": 2, "name": "林地"},
+    {"code": 3, "name": "灌木"},
+    {"code": 4, "name": "草地"},
+    {"code": 5, "name": "水体"},
+    {"code": 6, "name": "冰雪"},
+    {"code": 7, "name": "裸地"},
+    {"code": 8, "name": "不透水面"},
+    {"code": 9, "name": "湿地"}
+  ]
+}
