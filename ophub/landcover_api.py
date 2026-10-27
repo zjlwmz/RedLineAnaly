@@ -173,8 +173,13 @@ def analyze(request: AnalyzeRequest):
     split_level = settings.split_level
     landcover_jobs.create_task(task_id, split_level)
     # 先持久化任务 ID，再把行政区读取和栅格分块放入后台，避免大范围请求阻塞 HTTP 响应。
-    threading.Thread(target=_plan_and_dispatch, args=(task_id, split_level, request),
-                     name=f"clcd-plan-{task_id[:8]}", daemon=True).start()
+    try:
+        threading.Thread(target=_plan_and_dispatch, args=(task_id, split_level, request),
+                         name=f"clcd-plan-{task_id[:8]}", daemon=True).start()
+    except Exception as exc:
+        logger.exception("CLCD task %s planning thread failed to start", task_id)
+        landcover_jobs._fail_task(task_id, f"任务规划线程启动失败：{exc}")
+        return _fail(500, "任务规划线程启动失败")
     return JSONResponse(status_code=202, content=_ok({"task_id": task_id}))
 
 

@@ -18,16 +18,12 @@ outputs/
 *.db-shm
 
 # ---- GIS ----
-# 演示数据体积小且便于开箱验证，保留 data/redline/*.gpkg
-# 若换成真实红线数据（通常几百 MB ~ 几 GB），请取消下面注释并改用对象存储分发
-# data/redline/*.gpkg
 *.shp
 *.shx
 *.dbf
 *.prj
 *.qix
 *.cpg
-!data/**
 
 # ---- 编辑器 ----
 .idea/

@@ -132,6 +132,10 @@ def retry_failed_task(task_id: str) -> dict:
             raise ValueError("任务不存在")
         if task["status"] != "failed":
             raise ValueError("只有失败任务可以重试")
+        total = db.execute("SELECT COUNT(*) FROM landcover_subtasks WHERE task_id=?", (task_id,)).fetchone()[0]
+        if not total:
+            # 规划失败时即使残留 plan.json，也没有可重投的子任务，必须重新提交。
+            raise ValueError("任务尚未完成拆分，请重新提交分析")
         remaining = db.execute("SELECT COUNT(*) FROM landcover_subtasks WHERE task_id=? AND status!='success'",
                                (task_id,)).fetchone()[0]
         db.execute("UPDATE landcover_subtasks SET status='pending',published=0,error=NULL,worker_id=NULL "
